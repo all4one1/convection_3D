@@ -78,7 +78,14 @@
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <CudaCompile Include="CuPoisson\CudaReduction\CuReduction.cu" />
     <CudaCompile Include="kernel.cu" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="CuPoisson\CudaReduction\CuGraph.h" />
+    <ClInclude Include="CuPoisson\CudaReduction\CuReduction.h" />
+    <ClInclude Include="CuPoisson\CudaReduction\nvidia_kernels.h" />
+    <ClInclude Include="CuPoisson\CuPoisson.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
