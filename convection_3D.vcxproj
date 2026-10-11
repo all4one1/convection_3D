@@ -13,6 +13,8 @@
   <PropertyGroup Label="Globals">
     <ProjectGuid>{B526850B-8802-9F61-8C76-91771AC721A1}</ProjectGuid>
     <RootNamespace>convection_3D</RootNamespace>
+    <PreferredToolArchitecture>x64</PreferredToolArchitecture>
+    <CudaPreferredToolArchitecture>x64</CudaPreferredToolArchitecture>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
@@ -55,6 +57,9 @@
     </Link>
     <CudaCompile>
       <TargetMachinePlatform>64</TargetMachinePlatform>
+      <!-- Keep host symbols in objects: nvcc -g would override /Z7 with /Zi and require the compiler PDB service. -->
+      <DebugInformationFormat>OldStyle</DebugInformationFormat>
+      <HostDebugInfo>false</HostDebugInfo>
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -78,14 +83,23 @@
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <CudaCompile Include="CuPoisson\CudaReduction\CuReduction.cu" />
-    <CudaCompile Include="kernel.cu" />
+    <CudaCompile Include="src\CuPoisson\CudaReduction\CuReduction.cu" />
+    <CudaCompile Include="src\main.cu" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="CuPoisson\CudaReduction\CuGraph.h" />
-    <ClInclude Include="CuPoisson\CudaReduction\CuReduction.h" />
-    <ClInclude Include="CuPoisson\CudaReduction\nvidia_kernels.h" />
-    <ClInclude Include="CuPoisson\CuPoisson.h" />
+    <ClInclude Include="src\cfd\diagnostics.h" />
+    <ClInclude Include="src\cfd\solver.h" />
+    <ClInclude Include="src\cfd\solver_output.h" />
+    <ClInclude Include="src\cfd\solver_ternary.h" />
+    <ClInclude Include="src\common\init.h" />
+    <ClInclude Include="src\common\math.h" />
+    <ClInclude Include="src\common\types.h" />
+    <ClInclude Include="src\common\utilities.h" />
+    <ClInclude Include="src\common\utilities_cuda.h" />
+    <ClInclude Include="src\CuPoisson\CudaReduction\CuGraph.h" />
+    <ClInclude Include="src\CuPoisson\CudaReduction\CuReduction.h" />
+    <ClInclude Include="src\CuPoisson\CudaReduction\nvidia_kernels.h" />
+    <ClInclude Include="src\CuPoisson\CuPoisson.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

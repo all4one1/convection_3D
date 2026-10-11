@@ -1,0 +1,31 @@
+# Long nonlinear evolution of the conductive-state m=(1,0) perturbation.
+Lx = 2.0
+Ly = 1.0
+Lz = 1.0
+nx = 40
+ny = 20
+nz = 20
+
+tau = 0.0002
+Ra = 2300
+increment = -25
+read_recovery = 1
+call_max = 1
+timeq_min = 100000
+timeq_max = 200000
+
+Pr = 10.0
+Sc11 = 100.0
+Sc12 = 0.0
+Sc21 = 0.0
+Sc22 = 1000.0
+psi1 = 0.0
+psiS = -0.25
+Q = -1.0
+alpha = 0.0
+
+xbc = 1
+ybc = 0
+zbc = 1
+
+freq_fields = 20

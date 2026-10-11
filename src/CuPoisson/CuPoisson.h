@@ -18,7 +18,7 @@ __global__ void swap_(double* f_old, double* f_new, unsigned int n)
 	if (l < n)	f_old[l] = f_new[l];
 }
 
-
+//TODO: cudaLaunchKernelEx
 struct CuPoisson
 {
 	double eps_iter = 1e-5;
@@ -47,7 +47,7 @@ public:
 	CuPoisson() {}
 	CuPoisson(unsigned int N_, void* kernel_, void** args_, std::pair<int, int> main, dim3 grid_, dim3 block_, size_t smem_ = 0, cudaStream_t stream_ = 0)
 	{
-		set_kernel(N_, kernel_, args_, main, grid_, block_, smem_ = 0, stream_ = 0);
+		set_kernel(N_, kernel_, args_, main, grid_, block_, smem_, stream_);
 	}
 
 	/**
@@ -98,6 +98,54 @@ public:
 		if (k > 1000) std::cout << "device k = " << k << ", eps = " << eps << std::endl;
 		if (logs_out) k_write << k << " " << res << " " << eps << std::endl;
 	}
+
+	void solve_v1b()
+	{
+		k = 0;
+		eps = 1.0;
+		res = 0.0;
+		res0 = 0.0;
+
+		// В исходной конфигурации:
+		// args[first]  == &d.p
+		// args[second] == &d.p0
+		double** p_dest_slot = static_cast<double**>(args[main_index.first]);
+		double** p_src_slot = static_cast<double**>(args[main_index.second]);
+
+		// После прошлого solve d.p — итог, d.p0 — старый буфер.
+		// Для нового solve пишем в старый, читаем из итогового.
+		std::swap(*p_dest_slot, *p_src_slot);
+
+		for (k = 1; k < 1000000; ++k)
+		{
+			cudaLaunchKernel(kernel, gridDim, blockDim, args, smem, stream);
+
+			// Сейчас новое давление записано в d.p.
+			res = CR->reduce(*p_dest_slot, true);
+			eps = abs(res - res0) / (res0 + 1e-5);
+			res0 = res;
+
+			// Следующая итерация: меняем реальные буферы d.p и d.p0.
+			std::swap(*p_dest_slot, *p_src_slot);
+
+			if (eps < eps_iter)
+				break;
+
+			if (k % 1000 == 0)
+				std::cout << "device k = " << k << ", eps = " << eps << std::endl;
+		}
+
+		// После последнего обмена итог в d.p0.
+		// Возвращаем итог в d.p для velocity_correction и вывода.
+		std::swap(*p_dest_slot, *p_src_slot);
+
+		if (k > 1000)
+			std::cout << "device k = " << k << ", eps = " << eps << std::endl;
+
+		if (logs_out)
+			k_write << k << " " << res << " " << eps << std::endl;
+	}
+
 
 	void solve_v2(unsigned int k_minimal_threshold, unsigned int k_frequency)
 	{
