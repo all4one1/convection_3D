@@ -88,9 +88,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\cfd\diagnostics.h" />
+    <ClInclude Include="src\cfd\solver_ternary.h" />
     <ClInclude Include="src\cfd\solver.h" />
     <ClInclude Include="src\cfd\solver_output.h" />
-    <ClInclude Include="src\cfd\solver_ternary.h" />
     <ClInclude Include="src\common\init.h" />
     <ClInclude Include="src\common\math.h" />
     <ClInclude Include="src\common\types.h" />

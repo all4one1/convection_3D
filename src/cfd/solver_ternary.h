@@ -22,865 +22,430 @@ __global__ void device_parameter_check() {
 
 
 
-__global__ void quasi_velocity(double* ux_d, double* uy_d, double* uz_d, double* vx_d, double* vy_d, double* vz_d, double* T_d, double* T0_d, double* C1_d, double* C10_d, double* C2_d, double* C20_d) {
+__device__ __forceinline__ unsigned int periodic_source(unsigned int index, unsigned int last)
+{
+	if (index == 0) return last - 1;
+	if (index == last) return 1;
+	return index;
+}
 
-	unsigned int i = threadIdx.x + blockIdx.x * blockDim.x;
-	unsigned int j = threadIdx.y + blockIdx.y * blockDim.y;
-	unsigned int k = threadIdx.z + blockIdx.z * blockDim.z;
-	unsigned int l = i + dev.offset * j + dev.offset2 * k;
-	if (i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N)
+__device__ __forceinline__ unsigned int adjacent_interior(unsigned int index, unsigned int last)
+{
+	if (index == 0) return 1;
+	if (index == last) return last - 1;
+	return index;
+}
+
+__global__ void quasi_velocity(double* ux_d, double* uy_d, double* uz_d,
+	double* vx_d, double* vy_d, double* vz_d, double* T_d, double* T0_d,
+	double* C1_d, double* C10_d, double* C2_d, double* C20_d)
+{
+	const unsigned int i = threadIdx.x + blockIdx.x * blockDim.x;
+	const unsigned int j = threadIdx.y + blockIdx.y * blockDim.y;
+	const unsigned int k = threadIdx.z + blockIdx.z * blockDim.z;
+	const unsigned int l = i + dev.offset * j + dev.offset2 * k;
+	if (i > dev.nx || j > dev.ny || k > dev.nz || l >= dev.N) return;
+
+	const auto interior_velocity = [&](unsigned int ii, unsigned int jj, unsigned int kk)
+		{
+			const unsigned int q = ii + dev.offset * jj + dev.offset2 * kk;
+			const auto transport = [&](const double* velocity)
+				{
+					return -vx_d[q] * (velocity[q + 1] - velocity[q - 1]) / 2.0 / dev.hx
+						- vy_d[q] * (velocity[q + dev.offset] - velocity[q - dev.offset]) / 2.0 / dev.hy
+						- vz_d[q] * (velocity[q + dev.offset2] - velocity[q - dev.offset2]) / 2.0 / dev.hz
+						+ (velocity[q + 1] - 2.0 * velocity[q] + velocity[q - 1]) / dev.hx / dev.hx
+						+ (velocity[q + dev.offset] - 2.0 * velocity[q] + velocity[q - dev.offset]) / dev.hy / dev.hy
+						+ (velocity[q + dev.offset2] - 2.0 * velocity[q] + velocity[q - dev.offset2]) / dev.hz / dev.hz;
+				};
+			const double buoyancy = dev.Ra / dev.Pr * (T0_d[q] + C10_d[q] + C20_d[q]);
+			ux_d[l] = vx_d[q] + dev.tau * (transport(vx_d) + buoyancy * dev.sinA);
+			uy_d[l] = vy_d[q] + dev.tau * (transport(vy_d) + buoyancy * dev.cosA);
+			uz_d[l] = vz_d[q] + dev.tau * transport(vz_d);
+		};
+
+	const unsigned int ii = dev.xbc == periodic ? periodic_source(i, dev.nx) : i;
+	const unsigned int kk = dev.zbc == periodic ? periodic_source(k, dev.nz) : k;
+	const bool inside_x = ii > 0 && ii < dev.nx;
+	const bool inside_y = j > 0 && j < dev.ny;
+	const bool inside_z = kk > 0 && kk < dev.nz;
+	const unsigned int q = ii + dev.offset * j + dev.offset2 * kk;
+
+	if (inside_x && inside_y && inside_z)
+		interior_velocity(ii, j, kk);
+	// The pressure equation uses only the normal predictor on solid faces.
+	else if (j == 0 && inside_x && inside_z)
+		uy_d[l] = dev.tau / dev.hy / dev.hy
+		* (2.0 * vy_d[q] - 5.0 * vy_d[q + dev.offset] + 4.0 * vy_d[q + 2 * dev.offset] - vy_d[q + 3 * dev.offset])
+		+ dev.tau * dev.Ra / dev.Pr * (T0_d[q] + C10_d[q] + C20_d[q]) * dev.cosA;
+	else if (j == dev.ny && inside_x && inside_z)
+		uy_d[l] = dev.tau / dev.hy / dev.hy
+		* (2.0 * vy_d[q] - 5.0 * vy_d[q - dev.offset] + 4.0 * vy_d[q - 2 * dev.offset] - vy_d[q - 3 * dev.offset])
+		+ dev.tau * dev.Ra / dev.Pr * (T0_d[q] + C10_d[q] + C20_d[q]) * dev.cosA;
+	else if (dev.xbc == closed && i == 0 && inside_y && inside_z)
+		ux_d[l] = dev.tau / dev.hx / dev.hx * (2.0 * vx_d[q] - 5.0 * vx_d[q + 1] + 4.0 * vx_d[q + 2] - vx_d[q + 3])
+		+ dev.tau * dev.Ra / dev.Pr * (T0_d[q] + C10_d[q] + C20_d[q]) * dev.sinA;
+	else if (dev.xbc == closed && i == dev.nx && inside_y && inside_z)
+		ux_d[l] = dev.tau / dev.hx / dev.hx * (2.0 * vx_d[q] - 5.0 * vx_d[q - 1] + 4.0 * vx_d[q - 2] - vx_d[q - 3])
+		+ dev.tau * dev.Ra / dev.Pr * (T0_d[q] + C10_d[q] + C20_d[q]) * dev.sinA;
+	else if (dev.zbc == closed && k == 0 && inside_x && inside_y)
+		uz_d[l] = dev.tau / dev.hz / dev.hz
+		* (2.0 * vz_d[q] - 5.0 * vz_d[q + dev.offset2] + 4.0 * vz_d[q + 2 * dev.offset2] - vz_d[q + 3 * dev.offset2]);
+	else if (dev.zbc == closed && k == dev.nz && inside_x && inside_y)
+		uz_d[l] = dev.tau / dev.hz / dev.hz
+		* (2.0 * vz_d[q] - 5.0 * vz_d[q - dev.offset2] + 4.0 * vz_d[q - 2 * dev.offset2] - vz_d[q - 3 * dev.offset2]);
+}
+
+__global__ void temperature(double* ux_d, double* uy_d, double* uz_d,
+	double* vx_d, double* vy_d, double* vz_d, double* T_d, double* T0_d,
+	double* C1_d, double* C10_d, double* C2_d, double* C20_d)
+{
+	const unsigned int i = threadIdx.x + blockIdx.x * blockDim.x;
+	const unsigned int j = threadIdx.y + blockIdx.y * blockDim.y;
+	const unsigned int k = threadIdx.z + blockIdx.z * blockDim.z;
+	const unsigned int l = i + dev.offset * j + dev.offset2 * k;
+	if (i > dev.nx || j > dev.ny || k > dev.nz || l >= dev.N) return;
+
+	const auto interior_temperature = [&](unsigned int ii, unsigned int jj, unsigned int kk)
+		{
+			const unsigned int q = ii + dev.offset * jj + dev.offset2 * kk;
+			const double laplacian = (T0_d[q + 1] - 2.0 * T0_d[q] + T0_d[q - 1]) / dev.hx / dev.hx
+				+ (T0_d[q + dev.offset] - 2.0 * T0_d[q] + T0_d[q - dev.offset]) / dev.hy / dev.hy
+				+ (T0_d[q + dev.offset2] - 2.0 * T0_d[q] + T0_d[q - dev.offset2]) / dev.hz / dev.hz;
+			const double rhs = -vx_d[q] * (T0_d[q + 1] - T0_d[q - 1]) / (2.0 * dev.hx)
+				- vy_d[q] * (T0_d[q + dev.offset] - T0_d[q - dev.offset]) / (2.0 * dev.hy)
+				- vz_d[q] * (T0_d[q + dev.offset2] - T0_d[q - dev.offset2]) / (2.0 * dev.hz)
+				+ laplacian / dev.Pr;
+			return T0_d[q] + dev.tau * rhs;
+		};
+
+	// Evaluate periodic copies at their partner coordinates.
+	const unsigned int ii = dev.xbc == periodic ? periodic_source(i, dev.nx) : i;
+	const unsigned int kk = dev.zbc == periodic ? periodic_source(k, dev.nz) : k;
+	const bool inside_x = ii > 0 && ii < dev.nx;
+	const bool inside_y = j > 0 && j < dev.ny;
+	const bool inside_z = kk > 0 && kk < dev.nz;
+	const unsigned int q = ii + dev.offset * j + dev.offset2 * kk;
+
+	if (inside_x && inside_y && inside_z)
+		T_d[l] = interior_temperature(ii, j, kk);
+	else if (inside_x && inside_z)
 	{
-
-		/*
-		INNER
-		*/
-		if (i > 0 && i < dev.nx && j > 0 && j < dev.ny && k > 0 && k < dev.nz)
-		{
-
-			//ux_d
-			ux_d[l] = vx_d[l]
-				+ dev.tau * (
-					-vx_d[l] * (vx_d[l + 1] - vx_d[l - 1]) / 2.0 / dev.hx					//  (ux_d*d/dx) ux_d 
-					- vy_d[l] * (vx_d[l + dev.offset] - vx_d[l - dev.offset]) / 2.0 / dev.hy				//  (uy_d*d/dy) ux_d 
-					- vz_d[l] * (vx_d[l + dev.offset2] - vx_d[l - dev.offset2]) / 2.0 / dev.hz				//  (uy_d*d/dy) ux_d 
-
-					+ (vx_d[l + 1] - 2.0 * vx_d[l] + vx_d[l - 1]) / dev.hx / dev.hx				// (d2/dx2) ux_d
-					+ (vx_d[l + dev.offset] - 2.0 * vx_d[l] + vx_d[l - dev.offset]) / dev.hy / dev.hy			// (d2/dy2) ux_d   
-					+ (vx_d[l + dev.offset2] - 2.0 * vx_d[l] + vx_d[l - dev.offset2]) / dev.hz / dev.hz			// (d2/dz2) ux_d 
-
-					+ dev.Ra / dev.Pr * (T0_d[l] + C10_d[l] + C20_d[l]) * dev.sinA
-					);
-
-			//uy_d
-			uy_d[l] = vy_d[l]
-				+ dev.tau * (
-					-vx_d[l] * (vy_d[l + 1] - vy_d[l - 1]) / 2.0 / dev.hx					//  (ux_d*d/dx) uy_d
-					- vy_d[l] * (vy_d[l + dev.offset] - vy_d[l - dev.offset]) / 2.0 / dev.hy               //  (uy_d*d/dy) uy_d  
-					- vz_d[l] * (vy_d[l + dev.offset2] - vy_d[l - dev.offset2]) / 2.0 / dev.hz				//  (uy_d*d/dy) uy_d 
-
-					+ (vy_d[l + 1] - 2.0 * vy_d[l] + vy_d[l - 1]) / dev.hx / dev.hx				// (d2/dx2) uy_d
-					+ (vy_d[l + dev.offset] - 2.0 * vy_d[l] + vy_d[l - dev.offset]) / dev.hy / dev.hy			// (d2/dy2) uy_d   
-					+ (vy_d[l + dev.offset2] - 2.0 * vy_d[l] + vy_d[l - dev.offset2]) / dev.hz / dev.hz			// (d2/dz2) uy_d 
-
-					+ dev.Ra / dev.Pr * (T0_d[l] + C10_d[l] + C20_d[l]) * dev.cosA 						 // Ra/Pe*T_d
-					);
-
-			//uz_d
-			uz_d[l] = vz_d[l]
-				+ dev.tau * (
-					-vx_d[l] * (vz_d[l + 1] - vz_d[l - 1]) / 2.0 / dev.hx					//  (ux_d*d/dx) uz_d 
-					- vy_d[l] * (vz_d[l + dev.offset] - vz_d[l - dev.offset]) / 2.0 / dev.hy				//  (uy_d*d/dy) uz_d 
-					- vz_d[l] * (vz_d[l + dev.offset2] - vz_d[l - dev.offset2]) / 2.0 / dev.hz				//  (uy_d*d/dy) uz_d 
-
-					+ (vz_d[l + 1] - 2.0 * vz_d[l] + vz_d[l - 1]) / dev.hx / dev.hx				// (d2/dx2) uz_d
-					+ (vz_d[l + dev.offset] - 2.0 * vz_d[l] + vz_d[l - dev.offset]) / dev.hy / dev.hy			// (d2/dy2) uz_d   
-					+ (vz_d[l + dev.offset2] - 2.0 * vz_d[l] + vz_d[l - dev.offset2]) / dev.hz / dev.hz			// (d2/dz2) uz_d 
-
-					);
-
-		}
-
-		/*
-		UP-DOWN
-		*/
-
-		// y
-		else if (j == 0 && (i > 0 && i < dev.nx && k > 0 && k < dev.nz))
-		{
-			uy_d[l] = dev.tau / dev.hy / dev.hy * (2.0 * vy_d[l] - 5.0 * vy_d[l + dev.offset] + 4.0 * vy_d[l + dev.offset * 2] - vy_d[l + dev.offset * 3]) + dev.tau * dev.Ra / dev.Pr * (T0_d[l] + C10_d[l] + C20_d[l]) * dev.cosA;
-			//ux_d[l] = dev.tau / dev.hy / dev.hy*(2 * vx_d[l] - 5 * vx_d[l + dev.offset] + 4 * vx_d[l + dev.offset * 2] - vx_d[l + dev.offset * 3]);
-			//uz_d[l] = dev.tau / dev.hz / dev.hz*(2 * vz_d[l] - 5 * vz_d[l + dev.offset] + 4 * vz_d[l + dev.offset * 2] - vz_d[l + dev.offset * 3]);
-		}
-		else if (j == dev.ny && (i > 0 && i < dev.nx && k > 0 && k < dev.nz))
-		{
-			uy_d[l] = dev.tau / dev.hy / dev.hy * (2.0 * vy_d[l] - 5.0 * vy_d[l - dev.offset] + 4.0 * vy_d[l - dev.offset * 2] - vy_d[l - dev.offset * 3]) + dev.tau * dev.Ra / dev.Pr * (T0_d[l] + C10_d[l] + C20_d[l]) * dev.cosA;
-			//ux_d[l] = dev.tau / dev.hy / dev.hy*(2 * vx_d[l] - 5 * vx_d[l - dev.offset] + 4 * vx_d[l - dev.offset * 2] - vx_d[l - dev.offset * 3]);
-			//uz_d[l] = dev.tau / dev.hy / dev.hy*(2 * vz_d[l] - 5 * vz_d[l - dev.offset] + 4 * vz_d[l - dev.offset * 2] - vz_d[l - dev.offset * 3]);
-		}
-
-		/*
-		CLOSED
-		*/
-
-		// x
-		else if (dev.xbc == closed && i == 0 && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))
-		{
-			ux_d[l] = dev.tau / dev.hx / dev.hx * (2.0 * vx_d[l] - 5.0 * vx_d[l + 1] + 4.0 * vx_d[l + 2] - vx_d[l + 3]) + dev.tau * dev.Ra / dev.Pr * (T0_d[l] + C10_d[l] + C20_d[l]) * dev.sinA;
-			//uy_d[l] = dev.tau / dev.hx / dev.hx * (2 * vy_d[l] - 5 * vy_d[l + 1] + 4 * vy_d[l + 2] - vy_d[l + 3]);
-			//uz_d[l] = dev.tau / dev.hx / dev.hx * (2 * vz_d[l] - 5 * vz_d[l + 1] + 4 * vz_d[l + 2] - vz_d[l + 3]);
-		}
-		else if (dev.xbc == closed && i == dev.nx && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))
-		{
-			ux_d[l] = dev.tau / dev.hx / dev.hx * (2.0 * vx_d[l] - 5.0 * vx_d[l - 1] + 4.0 * vx_d[l - 2] - vx_d[l - 3]) + dev.tau * dev.Ra / dev.Pr * (T0_d[l] + C10_d[l] + C20_d[l]) * dev.sinA;
-			//uy_d[l] = dev.tau / dev.hx / dev.hx * (2 * vy_d[l] - 5 * vy_d[l - 1] + 4 * vy_d[l - 2] - vy_d[l - 3]);
-			//uz_d[l] = dev.tau / dev.hx / dev.hx * (2 * vz_d[l] - 5 * vz_d[l - 1] + 4 * vz_d[l - 2] - vz_d[l - 3]);
-		}
-
-		// z
-		else if (dev.zbc == closed && k == 0 && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))
-		{
-			//ux_d[l] = dev.tau / dev.hz / dev.hz * (2 * vx_d[l] - 5 * vx_d[l + dev.offset2] + 4 * vx_d[l + dev.offset2 * 2] - vx_d[l + dev.offset2 * 3]);
-			//uy_d[l] = dev.tau / dev.hz / dev.hz * (2 * vy_d[l] - 5 * vy_d[l + dev.offset2] + 4 * vy_d[l + dev.offset2 * 2] - vy_d[l + dev.offset2 * 3]);
-			uz_d[l] = dev.tau / dev.hz / dev.hz * (2.0 * vz_d[l] - 5.0 * vz_d[l + dev.offset2] + 4.0 * vz_d[l + dev.offset2 * 2] - vz_d[l + dev.offset2 * 3]);
-		}
-		else if (dev.zbc == closed && k == dev.nz && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))
-		{
-			//ux_d[l] = dev.tau / dev.hz / dev.hz * (2 * vx_d[l] - 5 * vx_d[l - dev.offset2] + 4 * vx_d[l - dev.offset2 * 2] - vx_d[l - dev.offset2 * 3]);
-			//uy_d[l] = dev.tau / dev.hz / dev.hz * (2 * vy_d[l] - 5 * vy_d[l - dev.offset2] + 4 * vy_d[l - dev.offset2 * 2] - vy_d[l - dev.offset2 * 3]);
-			uz_d[l] = dev.tau / dev.hz / dev.hz * (2.0 * vz_d[l] - 5.0 * vz_d[l - dev.offset2] + 4.0 * vz_d[l - dev.offset2 * 2] - vz_d[l - dev.offset2 * 3]);
-		}
-
-
-		/*
-		PERIODIC
-		*/
-
-		// x
-
-		else if (dev.xbc == periodic && i == 0 && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))
-		{
-			int ll = dev.nx - 1 + dev.offset * j + dev.offset2 * k;
-			/*
-			there is a slight possibility to come across the race condition effect while realizing parallel boundary condotions
-			we think it is acceptabele to re-calculate some date once more to eliminate it
-			ll index means the index on the opposite side but minus 1 (nx-1 here) as it goes to build a standard approach for parallel boundary conditions
-			after we re-calculate the data for this index, nx-1, (that, in fact, was found above in the section for the whole inner nodes)
-			*/
-
-			ux_d[l] = vx_d[ll]
-				+ dev.tau * (
-					-vx_d[ll] * (vx_d[ll + 1] - vx_d[ll - 1]) / 2.0 / dev.hx					//  (ux_d*d/dx) ux_d
-					- vy_d[ll] * (vx_d[ll + dev.offset] - vx_d[ll - dev.offset]) / 2.0 / dev.hy				//  (uy_d*d/dy) ux_d
-					- vz_d[ll] * (vx_d[ll + dev.offset2] - vx_d[ll - dev.offset2]) / 2.0 / dev.hz				//  (uy_d*d/dy) ux_d
-
-					+ (vx_d[ll + 1] - 2.0 * vx_d[ll] + vx_d[ll - 1]) / dev.hx / dev.hx				// (d2/dx2) ux_d
-					+ (vx_d[ll + dev.offset] - 2.0 * vx_d[ll] + vx_d[ll - dev.offset]) / dev.hy / dev.hy			// (d2/dy2) ux_d
-					+ (vx_d[ll + dev.offset2] - 2.0 * vx_d[ll] + vx_d[ll - dev.offset2]) / dev.hz / dev.hz			// (d2/dz2) ux_d
-					);
-
-		}
-		else if (dev.xbc == periodic && i == dev.nx && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))
-		{
-			int ll = 1 + dev.offset * j + dev.offset2 * k;
-			ux_d[l] = vx_d[ll]
-				+ dev.tau * (
-					-vx_d[ll] * (vx_d[ll + 1] - vx_d[ll - 1]) / 2.0 / dev.hx					//  (ux_d*d/dx) ux_d
-					- vy_d[ll] * (vx_d[ll + dev.offset] - vx_d[ll - dev.offset]) / 2.0 / dev.hy				//  (uy_d*d/dy) ux_d
-					- vz_d[ll] * (vx_d[ll + dev.offset2] - vx_d[ll - dev.offset2]) / 2.0 / dev.hz				//  (uy_d*d/dy) ux_d
-
-					+ (vx_d[ll + 1] - 2.0 * vx_d[ll] + vx_d[ll - 1]) / dev.hx / dev.hx				// (d2/dx2) ux_d
-					+ (vx_d[ll + dev.offset] - 2.0 * vx_d[ll] + vx_d[ll - dev.offset]) / dev.hy / dev.hy			// (d2/dy2) ux_d
-					+ (vx_d[ll + dev.offset2] - 2.0 * vx_d[ll] + vx_d[ll - dev.offset2]) / dev.hz / dev.hz			// (d2/dz2) ux_d
-					);
-		}
-
-		// z
-		else if (dev.zbc == periodic && k == 0 && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))
-		{
-			int ll = i + dev.offset * j + dev.offset2 * dev.nz - dev.offset2;
-
-			uz_d[l] = vz_d[ll]
-				+ dev.tau * (
-					-vx_d[ll] * (vz_d[ll + 1] - vz_d[ll - 1]) / 2.0 / dev.hx					//  (ux_d*d/dx) uz_d
-					- vy_d[ll] * (vz_d[ll + dev.offset] - vz_d[ll - dev.offset]) / 2.0 / dev.hy				//  (uy_d*d/dy) uz_d
-					- vz_d[ll] * (vz_d[ll + dev.offset2] - vz_d[ll - dev.offset2]) / 2.0 / dev.hz				//  (uy_d*d/dy) uz_d
-
-					+ (vz_d[ll + 1] - 2.0 * vz_d[ll] + vz_d[ll - 1]) / dev.hx / dev.hx				// (d2/dx2) uz_d
-					+ (vz_d[ll + dev.offset] - 2.0 * vz_d[ll] + vz_d[ll - dev.offset]) / dev.hy / dev.hy			// (d2/dy2) uz_d
-					+ (vz_d[ll + dev.offset2] - 2.0 * vz_d[ll] + vz_d[ll - dev.offset2]) / dev.hz / dev.hz			// (d2/dz2) uz_d
-					);
-
-		}
-		else if (dev.zbc == periodic && k == dev.nz && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))
-		{
-			int ll = i + dev.offset * j + dev.offset2;
-
-			uz_d[l] = vz_d[ll]
-				+ dev.tau * (
-					-vx_d[ll] * (vz_d[ll + 1] - vz_d[ll - 1]) / 2.0 / dev.hx					//  (ux_d*d/dx) uz_d
-					- vy_d[ll] * (vz_d[ll + dev.offset] - vz_d[ll - dev.offset]) / 2.0 / dev.hy				//  (uy_d*d/dy) uz_d
-					- vz_d[ll] * (vz_d[ll + dev.offset2] - vz_d[ll - dev.offset2]) / 2.0 / dev.hz				//  (uy_d*d/dy) uz_d
-
-					+ (vz_d[ll + 1] - 2.0 * vz_d[ll] + vz_d[ll - 1]) / dev.hx / dev.hx				// (d2/dx2) uz_d
-					+ (vz_d[ll + dev.offset] - 2.0 * vz_d[ll] + vz_d[ll - dev.offset]) / dev.hy / dev.hy			// (d2/dy2) uz_d
-					+ (vz_d[ll + dev.offset2] - 2.0 * vz_d[ll] + vz_d[ll - dev.offset2]) / dev.hz / dev.hz			// (d2/dz2) uz_d
-					);
-
-		}
-
-		// corner points
-
-		else if (i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N) {
-			int ii = i + 1 - i / dev.nx - ceil(i / (dev.nx + 1.0));
-			int jj = j + 1 - j / dev.ny - ceil(j / (dev.ny + 1.0));
-			int kk = k + 1 - k / dev.nz - ceil(k / (dev.nz + 1.0));
-
-			//ux_d[l] = 0;
-			//uy_d[l] = 0;
-			//uz_d[l] = 0;
-
-			//ux_d[l] = ux_d[ii + dev.offset*jj + dev.offset2*kk];
-			//uy_d[l] = uy_d[ii + dev.offset*jj + dev.offset2*kk];
-			//uz_d[l] = uz_d[ii + dev.offset*jj + dev.offset2*kk];
-		}
-
-
+		const double flux_correction = 2.0 / 3.0 * dev.hy * dev.Q;
+		if (j == 0)
+			T_d[l] = (4.0 * T0_d[q + dev.offset] - T0_d[q + 2 * dev.offset]) / 3.0 - flux_correction;
+		else
+			T_d[l] = (4.0 * T0_d[q - dev.offset] - T0_d[q - 2 * dev.offset]) / 3.0 + flux_correction;
+	}
+	else if (dev.xbc == closed && inside_y && inside_z)
+		T_d[l] = i == 0 ? (4.0 * T0_d[q + 1] - T0_d[q + 2]) / 3.0
+		: (4.0 * T0_d[q - 1] - T0_d[q - 2]) / 3.0;
+	else if (dev.zbc == closed && inside_x && inside_y)
+		T_d[l] = k == 0 ? (4.0 * T0_d[q + dev.offset2] - T0_d[q + 2 * dev.offset2]) / 3.0
+		: (4.0 * T0_d[q - dev.offset2] - T0_d[q - 2 * dev.offset2]) / 3.0;
+	else
+	{
+		const unsigned int inner = adjacent_interior(ii, dev.nx)
+			+ dev.offset * adjacent_interior(j, dev.ny)
+			+ dev.offset2 * adjacent_interior(kk, dev.nz);
+		T_d[l] = T0_d[inner];
 	}
 }
 
-__global__ void temperature(double* ux_d, double* uy_d, double* uz_d, double* vx_d, double* vy_d, double* vz_d, double* T_d, double* T0_d, double* C1_d, double* C10_d, double* C2_d, double* C20_d) {
+__global__ void temperature_fixed_value(double* ux_d, double* uy_d, double* uz_d,
+	double* vx_d, double* vy_d, double* vz_d, double* T_d, double* T0_d,
+	double* C1_d, double* C10_d, double* C2_d, double* C20_d)
+{
+	const unsigned int i = threadIdx.x + blockIdx.x * blockDim.x;
+	const unsigned int j = threadIdx.y + blockIdx.y * blockDim.y;
+	const unsigned int k = threadIdx.z + blockIdx.z * blockDim.z;
+	const unsigned int l = i + dev.offset * j + dev.offset2 * k;
+	if (i > dev.nx || j > dev.ny || k > dev.nz || l >= dev.N) return;
 
-
-	unsigned int i = threadIdx.x + blockIdx.x * blockDim.x;
-	unsigned int j = threadIdx.y + blockIdx.y * blockDim.y;
-	unsigned int k = threadIdx.z + blockIdx.z * blockDim.z;
-	unsigned int l = i + dev.offset * j + dev.offset2 * k;
-	if (i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N)
-	{
-
-		/*
-		INNER
-		*/
-		if (i > 0 && i < dev.nx && j > 0 && j < dev.ny && k > 0 && k < dev.nz)
+	const auto interior_temperature = [&](unsigned int ii, unsigned int jj, unsigned int kk)
 		{
+			const unsigned int q = ii + dev.offset * jj + dev.offset2 * kk;
+			const double laplacian = (T0_d[q + 1] - 2.0 * T0_d[q] + T0_d[q - 1]) / dev.hx / dev.hx
+				+ (T0_d[q + dev.offset] - 2.0 * T0_d[q] + T0_d[q - dev.offset]) / dev.hy / dev.hy
+				+ (T0_d[q + dev.offset2] - 2.0 * T0_d[q] + T0_d[q - dev.offset2]) / dev.hz / dev.hz;
+			const double rhs = -vx_d[q] * (T0_d[q + 1] - T0_d[q - 1]) / (2.0 * dev.hx)
+				- vy_d[q] * (T0_d[q + dev.offset] - T0_d[q - dev.offset]) / (2.0 * dev.hy)
+				- vz_d[q] * (T0_d[q + dev.offset2] - T0_d[q - dev.offset2]) / (2.0 * dev.hz)
+				+ laplacian / dev.Pr;
+			return T0_d[q] + dev.tau * rhs;
+		};
 
-			//temperature
-			T_d[l] = T0_d[l]
-				+ dev.tau * (
-					-vx_d[l] * (T0_d[l + 1] - T0_d[l - 1]) / (2.0 * dev.hx)					// (ux_d*d/dx) T_d
-					- vy_d[l] * (T0_d[l + dev.offset] - T0_d[l - dev.offset]) / (2.0 * dev.hy)				// (uy_d*d/dy) T_d
-					- vz_d[l] * (T0_d[l + dev.offset2] - T0_d[l - dev.offset2]) / (2.0 * dev.hz)				// (uz_d*d/dy) T_d
+	// Evaluate periodic copies at their partner coordinates.
+	const unsigned int ii = dev.xbc == periodic ? periodic_source(i, dev.nx) : i;
+	const unsigned int kk = dev.zbc == periodic ? periodic_source(k, dev.nz) : k;
+	const bool inside_x = ii > 0 && ii < dev.nx;
+	const bool inside_y = j > 0 && j < dev.ny;
+	const bool inside_z = kk > 0 && kk < dev.nz;
+	const unsigned int q = ii + dev.offset * j + dev.offset2 * kk;
 
-					+ ((T0_d[l + 1] - 2.0 * T0_d[l] + T0_d[l - 1]) / dev.hx / dev.hx 		// 1/Pr*(d2/dx2) T_d
-						+ (T0_d[l + dev.offset] - 2.0 * T0_d[l] + T0_d[l - dev.offset]) / dev.hy / dev.hy 	// 1/Pr*(d2/dy2) T_d
-						+ (T0_d[l + dev.offset2] - 2.0 * T0_d[l] + T0_d[l - dev.offset2]) / dev.hz / dev.hz) / dev.Pr	// 1/Pr*(d2/dz2) T_d
-					);
-
-		}
-
-		/*
-		UP-DOWN
-		*/
-
-		// y
-		else if (j == 0 && (i > 0 && i < dev.nx && k > 0 && k < dev.nz)) 		T_d[l] = (4.0 * T0_d[l + dev.offset] - T0_d[l + dev.offset * 2]) / 3.0 - 2.0 / 3.0 * dev.hy * dev.Q;
-		else if (j == dev.ny && (i > 0 && i < dev.nx && k > 0 && k < dev.nz))		T_d[l] = (4.0 * T0_d[l - dev.offset] - T0_d[l - dev.offset * 2]) / 3.0 + 2.0 / 3.0 * dev.hy * dev.Q;
-
-		/*
-		CLOSED
-		*/
-
-		// x
-		else if (dev.xbc == closed && i == 0 && (j > 0 && j < dev.ny && k > 0 && k < dev.nz)) 		T_d[l] = (4.0 * T0_d[l + 1] - T0_d[l + 2]) / 3.0;
-		else if (dev.xbc == closed && i == dev.nx && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))		T_d[l] = (4.0 * T0_d[l - 1] - T0_d[l - 2]) / 3.0;
-
-		// z
-		else if (dev.zbc == closed && k == 0 && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		T_d[l] = (4.0 * T0_d[l + dev.offset2] - T0_d[l + dev.offset2 * 2]) / 3.0;
-		else if (dev.zbc == closed && k == dev.nz && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		T_d[l] = (4.0 * T0_d[l - dev.offset2] - T0_d[l - dev.offset2 * 2]) / 3.0;
-
-
-		/*
-		PERIODIC
-		*/
-
-		// x
-
-		else if (dev.xbc == periodic && i == 0 && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))		T_d[l] = T0_d[dev.nx - 1 + dev.offset * j + dev.offset2 * k];
-		else if (dev.xbc == periodic && i == dev.nx && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))		T_d[l] = T0_d[1 + dev.offset * j + dev.offset2 * k];
-
-		// z
-		else if (dev.zbc == periodic && k == 0 && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		T_d[l] = T0_d[i + dev.offset * j + dev.offset2 * dev.nz - dev.offset2];
-		else if (dev.zbc == periodic && k == dev.nz && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		T_d[l] = T0_d[i + dev.offset * j + dev.offset2];
-
-
-		// corner points
-
-		else if (i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N) {
-			int ii = i + 1 - i / dev.nx - ceil(i / (dev.nx + 1.0));
-			int jj = j + 1 - j / dev.ny - ceil(j / (dev.ny + 1.0));
-			int kk = k + 1 - k / dev.nz - ceil(k / (dev.nz + 1.0));
-
-			T_d[l] = T0_d[ii + dev.offset * jj + dev.offset2 * kk];
-		}
-
-
-	}
-}
-__global__ void temperature_fixed_value(double* ux_d, double* uy_d, double* uz_d, double* vx_d, double* vy_d, double* vz_d, double* T_d, double* T0_d, double* C1_d, double* C10_d, double* C2_d, double* C20_d) {
-
-
-	unsigned int i = threadIdx.x + blockIdx.x * blockDim.x;
-	unsigned int j = threadIdx.y + blockIdx.y * blockDim.y;
-	unsigned int k = threadIdx.z + blockIdx.z * blockDim.z;
-	unsigned int l = i + dev.offset * j + dev.offset2 * k;
-	if (i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N)
+	if (inside_x && inside_y && inside_z)
+		T_d[l] = interior_temperature(ii, j, kk);
+	else if (inside_x && inside_z)
+		T_d[l] = j == 0 ? 1.0 : 0.0;
+	else if (dev.xbc == closed && inside_y && inside_z)
+		T_d[l] = i == 0 ? (4.0 * T0_d[q + 1] - T0_d[q + 2]) / 3.0
+		: (4.0 * T0_d[q - 1] - T0_d[q - 2]) / 3.0;
+	else if (dev.zbc == closed && inside_x && inside_y)
+		T_d[l] = k == 0 ? (4.0 * T0_d[q + dev.offset2] - T0_d[q + 2 * dev.offset2]) / 3.0
+		: (4.0 * T0_d[q - dev.offset2] - T0_d[q - 2 * dev.offset2]) / 3.0;
+	else
 	{
-
-		/*
-		INNER
-		*/
-		if (i > 0 && i < dev.nx && j > 0 && j < dev.ny && k > 0 && k < dev.nz)
-		{
-
-			//temperature
-			T_d[l] = T0_d[l]
-				+ dev.tau * (
-					-vx_d[l] * (T0_d[l + 1] - T0_d[l - 1]) / (2.0 * dev.hx)					// (ux_d*d/dx) T_d
-					- vy_d[l] * (T0_d[l + dev.offset] - T0_d[l - dev.offset]) / (2.0 * dev.hy)				// (uy_d*d/dy) T_d
-					- vz_d[l] * (T0_d[l + dev.offset2] - T0_d[l - dev.offset2]) / (2.0 * dev.hz)				// (uz_d*d/dy) T_d
-
-					+ ((T0_d[l + 1] - 2.0 * T0_d[l] + T0_d[l - 1]) / dev.hx / dev.hx 		// 1/Pr*(d2/dx2) T_d
-						+ (T0_d[l + dev.offset] - 2.0 * T0_d[l] + T0_d[l - dev.offset]) / dev.hy / dev.hy 	// 1/Pr*(d2/dy2) T_d
-						+ (T0_d[l + dev.offset2] - 2.0 * T0_d[l] + T0_d[l - dev.offset2]) / dev.hz / dev.hz) / dev.Pr	// 1/Pr*(d2/dz2) T_d
-					);
-
-		}
-
-		/*
-		UP-DOWN
-		*/
-
-		// y
-		else if (j == 0 && (i > 0 && i < dev.nx && k > 0 && k < dev.nz)) 		T_d[l] = 1;
-		else if (j == dev.ny && (i > 0 && i < dev.nx && k > 0 && k < dev.nz))		T_d[l] = 0;
-
-		/*
-		CLOSED
-		*/
-
-		// x
-		else if (dev.xbc == closed && i == 0 && (j > 0 && j < dev.ny && k > 0 && k < dev.nz)) 		T_d[l] = (4.0 * T0_d[l + 1] - T0_d[l + 2]) / 3.0;
-		else if (dev.xbc == closed && i == dev.nx && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))		T_d[l] = (4.0 * T0_d[l - 1] - T0_d[l - 2]) / 3.0;
-
-		// z
-		else if (dev.zbc == closed && k == 0 && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		T_d[l] = (4.0 * T0_d[l + dev.offset2] - T0_d[l + dev.offset2 * 2]) / 3.0;
-		else if (dev.zbc == closed && k == dev.nz && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		T_d[l] = (4.0 * T0_d[l - dev.offset2] - T0_d[l - dev.offset2 * 2]) / 3.0;
-
-
-		/*
-		PERIODIC
-		*/
-
-		// x
-
-		else if (dev.xbc == periodic && i == 0 && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))		T_d[l] = T0_d[dev.nx - 1 + dev.offset * j + dev.offset2 * k];
-		else if (dev.xbc == periodic && i == dev.nx && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))		T_d[l] = T0_d[1 + dev.offset * j + dev.offset2 * k];
-
-		// z
-		else if (dev.zbc == periodic && k == 0 && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		T_d[l] = T0_d[i + dev.offset * j + dev.offset2 * dev.nz - dev.offset2];
-		else if (dev.zbc == periodic && k == dev.nz && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		T_d[l] = T0_d[i + dev.offset * j + dev.offset2];
-
-
-		// corner points
-
-		else if (i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N) {
-			int ii = i + 1 - i / dev.nx - ceil(i / (dev.nx + 1.0));
-			int jj = j + 1 - j / dev.ny - ceil(j / (dev.ny + 1.0));
-			int kk = k + 1 - k / dev.nz - ceil(k / (dev.nz + 1.0));
-
-			T_d[l] = T0_d[ii + dev.offset * jj + dev.offset2 * kk];
-		}
-
-
+		const unsigned int inner = adjacent_interior(ii, dev.nx)
+			+ dev.offset * adjacent_interior(j, dev.ny)
+			+ dev.offset2 * adjacent_interior(kk, dev.nz);
+		T_d[l] = T0_d[inner];
 	}
 }
 
+__global__ void concentration1(double* ux_d, double* uy_d, double* uz_d,
+	double* vx_d, double* vy_d, double* vz_d, double* T_d, double* T0_d,
+	double* C1_d, double* C10_d, double* C2_d, double* C20_d)
+{
+	const unsigned int i = threadIdx.x + blockIdx.x * blockDim.x;
+	const unsigned int j = threadIdx.y + blockIdx.y * blockDim.y;
+	const unsigned int k = threadIdx.z + blockIdx.z * blockDim.z;
+	const unsigned int l = i + dev.offset * j + dev.offset2 * k;
+	if (i > dev.nx || j > dev.ny || k > dev.nz || l >= dev.N) return;
 
-
-__global__ void concentration1(double* ux_d, double* uy_d, double* uz_d, double* vx_d, double* vy_d, double* vz_d, double* T_d, double* T0_d, double* C1_d, double* C10_d, double* C2_d, double* C20_d) {
-
-
-	unsigned int i = threadIdx.x + blockIdx.x * blockDim.x;
-	unsigned int j = threadIdx.y + blockIdx.y * blockDim.y;
-	unsigned int k = threadIdx.z + blockIdx.z * blockDim.z;
-	unsigned int l = i + dev.offset * j + dev.offset2 * k;
-	if (i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N)
-	{
-
-		/*
-		INNER
-		*/
-		if (i > 0 && i < dev.nx && j > 0 && j < dev.ny && k > 0 && k < dev.nz)
+	const auto interior_concentration = [&](unsigned int ii, unsigned int jj, unsigned int kk)
 		{
+			const unsigned int q = ii + dev.offset * jj + dev.offset2 * kk;
+			const auto laplacian = [&](const double* values)
+				{
+					return (values[q + 1] - 2.0 * values[q] + values[q - 1]) / dev.hx / dev.hx
+						+ (values[q + dev.offset] - 2.0 * values[q] + values[q - dev.offset]) / dev.hy / dev.hy
+						+ (values[q + dev.offset2] - 2.0 * values[q] + values[q - dev.offset2]) / dev.hz / dev.hz;
+				};
+			double rhs = -vx_d[q] * (C10_d[q + 1] - C10_d[q - 1]) / (2.0 * dev.hx)
+				- vy_d[q] * (C10_d[q + dev.offset] - C10_d[q - dev.offset]) / (2.0 * dev.hy)
+				- vz_d[q] * (C10_d[q + dev.offset2] - C10_d[q - dev.offset2]) / (2.0 * dev.hz)
+				+ laplacian(C10_d) / dev.Sc11;
+			// Species diffusion acts on C - psi * T.
+			rhs -= laplacian(T0_d) / dev.Sc11 * dev.psi1;
+			return C10_d[q] + dev.tau * rhs;
+		};
 
-			//C1
-			C1_d[l] = C10_d[l]
-				+ dev.tau * (
-					-vx_d[l] * (C10_d[l + 1] - C10_d[l - 1]) / (2.0 * dev.hx)					// (ux_d*d/dx) C1_d
-					- vy_d[l] * (C10_d[l + dev.offset] - C10_d[l - dev.offset]) / (2.0 * dev.hy)				// (uy_d*d/dy) C1_d
-					- vz_d[l] * (C10_d[l + dev.offset2] - C10_d[l - dev.offset2]) / (2.0 * dev.hz)				// (uz_d*d/dy) C1_d
+	// Evaluate periodic copies at their partner coordinates.
+	const unsigned int ii = dev.xbc == periodic ? periodic_source(i, dev.nx) : i;
+	const unsigned int kk = dev.zbc == periodic ? periodic_source(k, dev.nz) : k;
+	const bool inside_x = ii > 0 && ii < dev.nx;
+	const bool inside_y = j > 0 && j < dev.ny;
+	const bool inside_z = kk > 0 && kk < dev.nz;
+	const unsigned int q = ii + dev.offset * j + dev.offset2 * kk;
 
-					+ ((C10_d[l + 1] - 2.0 * C10_d[l] + C10_d[l - 1]) / dev.hx / dev.hx 	// 1/Pr*(d2/dx2) C1_d
-						+ (C10_d[l + dev.offset] - 2.0 * C10_d[l] + C10_d[l - dev.offset]) / dev.hy / dev.hy 	// 1/Pr*(d2/dy2) C1_d
-						+ (C10_d[l + dev.offset2] - 2.0 * C10_d[l] + C10_d[l - dev.offset2]) / dev.hz / dev.hz) / dev.Sc11	// 1/Pr*(d2/dz2) C1_d
-
-					- (+(T0_d[l + 1] - 2.0 * T0_d[l] + T0_d[l - 1]) / dev.hx / dev.hx 		// 1/Pr*(d2/dx2) T_d
-						+ (T0_d[l + dev.offset] - 2.0 * T0_d[l] + T0_d[l - dev.offset]) / dev.hy / dev.hy 	// 1/Pr*(d2/dy2) T_d
-						+ (T0_d[l + dev.offset2] - 2.0 * T0_d[l] + T0_d[l - dev.offset2]) / dev.hz / dev.hz) / dev.Sc11 * dev.psi1	// 1/Pr*(d2/dz2) T_d
-					);
-
-		}
-
-
-
-		/*
-		UP-DOWN
-		*/
-
-		// y
-		else if (j == 0 && (i > 0 && i < dev.nx && k > 0 && k < dev.nz)) 		C1_d[l] = (4.0 * C10_d[l + dev.offset] - C10_d[l + dev.offset * 2]) / 3.0 - 2.0 / 3.0 * dev.hy * dev.psi1 * dev.Q;
-		else if (j == dev.ny && (i > 0 && i < dev.nx && k > 0 && k < dev.nz))		C1_d[l] = (4.0 * C10_d[l - dev.offset] - C10_d[l - dev.offset * 2]) / 3.0 + 2.0 / 3.0 * dev.hy * dev.psi1 * dev.Q;
-
-		/*
-		CLOSED
-		*/
-
-		// x
-		else if (dev.xbc == closed && i == 0 && (j > 0 && j < dev.ny && k > 0 && k < dev.nz)) 		C1_d[l] = (4.0 * C10_d[l + 1] - C10_d[l + 2]) / 3.0;
-		else if (dev.xbc == closed && i == dev.nx && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))		C1_d[l] = (4.0 * C10_d[l - 1] - C10_d[l - 2]) / 3.0;
-
-		// z
-		else if (dev.zbc == closed && k == 0 && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		C1_d[l] = (4.0 * C10_d[l + dev.offset2] - C10_d[l + dev.offset2 * 2]) / 3.0;
-		else if (dev.zbc == closed && k == dev.nz && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		C1_d[l] = (4.0 * C10_d[l - dev.offset2] - C10_d[l - dev.offset2 * 2]) / 3.0;
-
-
-		/*
-		PERIODIC
-		*/
-
-		// x
-
-		else if (dev.xbc == periodic && i == 0 && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))		C1_d[l] = C10_d[dev.nx - 1 + dev.offset * j + dev.offset2 * k];
-		else if (dev.xbc == periodic && i == dev.nx && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))		C1_d[l] = C10_d[1 + dev.offset * j + dev.offset2 * k];
-
-		// z
-		else if (dev.zbc == periodic && k == 0 && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		C1_d[l] = C10_d[i + dev.offset * j + dev.offset2 * dev.nz - dev.offset2];
-		else if (dev.zbc == periodic && k == dev.nz && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		C1_d[l] = C10_d[i + dev.offset * j + dev.offset2];
-
-
-		// corner points
-
-		else if (i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N) {
-
-			int ii = i + 1 - i / dev.nx - ceil(i / (dev.nx + 1.0));
-			int jj = j + 1 - j / dev.ny - ceil(j / (dev.ny + 1.0));
-			int kk = k + 1 - k / dev.nz - ceil(k / (dev.nz + 1.0));
-
-			C1_d[l] = C10_d[ii + dev.offset * jj + dev.offset2 * kk];
-		}
-
-
+	if (inside_x && inside_y && inside_z)
+		C1_d[l] = interior_concentration(ii, j, kk);
+	else if (inside_x && inside_z)
+	{
+		const double flux_correction = 2.0 / 3.0 * dev.hy * dev.psi1 * dev.Q;
+		if (j == 0)
+			C1_d[l] = (4.0 * C10_d[q + dev.offset] - C10_d[q + 2 * dev.offset]) / 3.0 - flux_correction;
+		else
+			C1_d[l] = (4.0 * C10_d[q - dev.offset] - C10_d[q - 2 * dev.offset]) / 3.0 + flux_correction;
 	}
-}
-__global__ void concentration2(double* ux_d, double* uy_d, double* uz_d, double* vx_d, double* vy_d, double* vz_d, double* T_d, double* T0_d, double* C1_d, double* C10_d, double* C2_d, double* C20_d) {
-
-
-	unsigned int i = threadIdx.x + blockIdx.x * blockDim.x;
-	unsigned int j = threadIdx.y + blockIdx.y * blockDim.y;
-	unsigned int k = threadIdx.z + blockIdx.z * blockDim.z;
-	unsigned int l = i + dev.offset * j + dev.offset2 * k;
-	if (i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N)
+	else if (dev.xbc == closed && inside_y && inside_z)
+		C1_d[l] = i == 0 ? (4.0 * C10_d[q + 1] - C10_d[q + 2]) / 3.0
+		: (4.0 * C10_d[q - 1] - C10_d[q - 2]) / 3.0;
+	else if (dev.zbc == closed && inside_x && inside_y)
+		C1_d[l] = k == 0 ? (4.0 * C10_d[q + dev.offset2] - C10_d[q + 2 * dev.offset2]) / 3.0
+		: (4.0 * C10_d[q - dev.offset2] - C10_d[q - 2 * dev.offset2]) / 3.0;
+	else
 	{
-
-		/*
-		INNER
-		*/
-		if (i > 0 && i < dev.nx && j > 0 && j < dev.ny && k > 0 && k < dev.nz)
-		{
-
-			//C2
-			C2_d[l] = C20_d[l]
-				+ dev.tau * (
-					-vx_d[l] * (C20_d[l + 1] - C20_d[l - 1]) / (2.0 * dev.hx)					// (ux_d*d/dx) C2_d
-					- vy_d[l] * (C20_d[l + dev.offset] - C20_d[l - dev.offset]) / (2.0 * dev.hy)				// (uy_d*d/dy) C2_d
-					- vz_d[l] * (C20_d[l + dev.offset2] - C20_d[l - dev.offset2]) / (2.0 * dev.hz)				// (uz_d*d/dy) C2_d
-
-					+ ((C20_d[l + 1] - 2.0 * C20_d[l] + C20_d[l - 1]) / dev.hx / dev.hx 	// 1/Pr*(d2/dx2) C2_d
-						+ (C20_d[l + dev.offset] - 2.0 * C20_d[l] + C20_d[l - dev.offset]) / dev.hy / dev.hy 	// 1/Pr*(d2/dy2) C2_d
-						+ (C20_d[l + dev.offset2] - 2.0 * C20_d[l] + C20_d[l - dev.offset2]) / dev.hz / dev.hz) / dev.Sc22	// 1/Pr*(d2/dz2) C2_d
-
-					- (+(T0_d[l + 1] - 2.0 * T0_d[l] + T0_d[l - 1]) / dev.hx / dev.hx 		// 1/Pr*(d2/dx2) T_d
-						+ (T0_d[l + dev.offset] - 2.0 * T0_d[l] + T0_d[l - dev.offset]) / dev.hy / dev.hy 	// 1/Pr*(d2/dy2) T_d
-						+ (T0_d[l + dev.offset2] - 2.0 * T0_d[l] + T0_d[l - dev.offset2]) / dev.hz / dev.hz) / dev.Sc22 * dev.psi2	// 1/Pr*(d2/dz2) T_d
-					);
-
-		}
-
-
-
-		/*
-		UP-DOWN
-		*/
-
-		// y
-		else if (j == 0 && (i > 0 && i < dev.nx && k > 0 && k < dev.nz)) 		C2_d[l] = (4.0 * C20_d[l + dev.offset] - C20_d[l + dev.offset * 2]) / 3.0 - 2.0 / 3.0 * dev.hy * dev.psi2 * dev.Q;
-		else if (j == dev.ny && (i > 0 && i < dev.nx && k > 0 && k < dev.nz))		C2_d[l] = (4.0 * C20_d[l - dev.offset] - C20_d[l - dev.offset * 2]) / 3.0 + 2.0 / 3.0 * dev.hy * dev.psi2 * dev.Q;
-
-		/*
-		CLOSED
-		*/
-
-		// x
-		else if (dev.xbc == closed && i == 0 && (j > 0 && j < dev.ny && k > 0 && k < dev.nz)) 		C2_d[l] = (4.0 * C20_d[l + 1] - C20_d[l + 2]) / 3.0;
-		else if (dev.xbc == closed && i == dev.nx && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))		C2_d[l] = (4.0 * C20_d[l - 1] - C20_d[l - 2]) / 3.0;
-
-		// z
-		else if (dev.zbc == closed && k == 0 && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		C2_d[l] = (4.0 * C20_d[l + dev.offset2] - C20_d[l + dev.offset2 * 2]) / 3.0;
-		else if (dev.zbc == closed && k == dev.nz && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		C2_d[l] = (4.0 * C20_d[l - dev.offset2] - C20_d[l - dev.offset2 * 2]) / 3.0;
-
-
-		/*
-		PERIODIC
-		*/
-
-		// x
-
-		else if (dev.xbc == periodic && i == 0 && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))		C2_d[l] = C20_d[dev.nx - 1 + dev.offset * j + dev.offset2 * k];
-		else if (dev.xbc == periodic && i == dev.nx && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))		C2_d[l] = C20_d[1 + dev.offset * j + dev.offset2 * k];
-
-		// z
-		else if (dev.zbc == periodic && k == 0 && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		C2_d[l] = C20_d[i + dev.offset * j + dev.offset2 * dev.nz - dev.offset2];
-		else if (dev.zbc == periodic && k == dev.nz && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		C2_d[l] = C20_d[i + dev.offset * j + dev.offset2];
-
-
-		// corner points
-
-		else if (i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N) {
-
-			int ii = i + 1 - i / dev.nx - ceil(i / (dev.nx + 1.0));
-			int jj = j + 1 - j / dev.ny - ceil(j / (dev.ny + 1.0));
-			int kk = k + 1 - k / dev.nz - ceil(k / (dev.nz + 1.0));
-
-			C2_d[l] = C20_d[ii + dev.offset * jj + dev.offset2 * kk];
-		}
-
-
+		const unsigned int inner = adjacent_interior(ii, dev.nx)
+			+ dev.offset * adjacent_interior(j, dev.ny)
+			+ dev.offset2 * adjacent_interior(kk, dev.nz);
+		C1_d[l] = C10_d[inner];
 	}
 }
 
+__global__ void concentration2(double* ux_d, double* uy_d, double* uz_d,
+	double* vx_d, double* vy_d, double* vz_d, double* T_d, double* T0_d,
+	double* C1_d, double* C10_d, double* C2_d, double* C20_d)
+{
+	const unsigned int i = threadIdx.x + blockIdx.x * blockDim.x;
+	const unsigned int j = threadIdx.y + blockIdx.y * blockDim.y;
+	const unsigned int k = threadIdx.z + blockIdx.z * blockDim.z;
+	const unsigned int l = i + dev.offset * j + dev.offset2 * k;
+	if (i > dev.nx || j > dev.ny || k > dev.nz || l >= dev.N) return;
 
+	const auto interior_concentration = [&](unsigned int ii, unsigned int jj, unsigned int kk)
+		{
+			const unsigned int q = ii + dev.offset * jj + dev.offset2 * kk;
+			const auto laplacian = [&](const double* values)
+				{
+					return (values[q + 1] - 2.0 * values[q] + values[q - 1]) / dev.hx / dev.hx
+						+ (values[q + dev.offset] - 2.0 * values[q] + values[q - dev.offset]) / dev.hy / dev.hy
+						+ (values[q + dev.offset2] - 2.0 * values[q] + values[q - dev.offset2]) / dev.hz / dev.hz;
+				};
+			double rhs = -vx_d[q] * (C20_d[q + 1] - C20_d[q - 1]) / (2.0 * dev.hx)
+				- vy_d[q] * (C20_d[q + dev.offset] - C20_d[q - dev.offset]) / (2.0 * dev.hy)
+				- vz_d[q] * (C20_d[q + dev.offset2] - C20_d[q - dev.offset2]) / (2.0 * dev.hz)
+				+ laplacian(C20_d) / dev.Sc22;
+			// Species diffusion acts on C - psi * T.
+			rhs -= laplacian(T0_d) / dev.Sc22 * dev.psi2;
+			return C20_d[q] + dev.tau * rhs;
+		};
 
-__global__ void velocity_correction(double* ux_d, double* uy_d, double* uz_d, double* vx_d, double* vy_d, double* vz_d, double* p_d) {
+	// Evaluate periodic copies at their partner coordinates.
+	const unsigned int ii = dev.xbc == periodic ? periodic_source(i, dev.nx) : i;
+	const unsigned int kk = dev.zbc == periodic ? periodic_source(k, dev.nz) : k;
+	const bool inside_x = ii > 0 && ii < dev.nx;
+	const bool inside_y = j > 0 && j < dev.ny;
+	const bool inside_z = kk > 0 && kk < dev.nz;
+	const unsigned int q = ii + dev.offset * j + dev.offset2 * kk;
 
-
-	unsigned int i = threadIdx.x + blockIdx.x * blockDim.x;
-	unsigned int j = threadIdx.y + blockIdx.y * blockDim.y;
-	unsigned int k = threadIdx.z + blockIdx.z * blockDim.z;
-	unsigned int l = i + dev.offset * j + dev.offset2 * k;
-
-	if (dev.xbc == closed && i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N)
+	if (inside_x && inside_y && inside_z)
+		C2_d[l] = interior_concentration(ii, j, kk);
+	else if (inside_x && inside_z)
 	{
-		if (i > 0 && i < dev.nx && j > 0 && j < dev.ny && k > 0 && k < dev.nz)
-		{
-			vx_d[l] = ux_d[l] - dev.tau / (2.0 * dev.hx) * (p_d[l + 1] - p_d[l - 1]);
-			vy_d[l] = uy_d[l] - dev.tau / (2.0 * dev.hy) * (p_d[l + dev.offset] - p_d[l - dev.offset]);
-			vz_d[l] = uz_d[l] - dev.tau / (2.0 * dev.hz) * (p_d[l + dev.offset2] - p_d[l - dev.offset2]);
-		}
-		else if (i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N) {
-			vx_d[l] = 0; vy_d[l] = 0; 	vz_d[l] = 0;
-		}
-
+		const double flux_correction = 2.0 / 3.0 * dev.hy * dev.psi2 * dev.Q;
+		if (j == 0)
+			C2_d[l] = (4.0 * C20_d[q + dev.offset] - C20_d[q + 2 * dev.offset]) / 3.0 - flux_correction;
+		else
+			C2_d[l] = (4.0 * C20_d[q - dev.offset] - C20_d[q - 2 * dev.offset]) / 3.0 + flux_correction;
 	}
-
-
-	else if (dev.xbc == periodic && i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N)
+	else if (dev.xbc == closed && inside_y && inside_z)
+		C2_d[l] = i == 0 ? (4.0 * C20_d[q + 1] - C20_d[q + 2]) / 3.0
+		: (4.0 * C20_d[q - 1] - C20_d[q - 2]) / 3.0;
+	else if (dev.zbc == closed && inside_x && inside_y)
+		C2_d[l] = k == 0 ? (4.0 * C20_d[q + dev.offset2] - C20_d[q + 2 * dev.offset2]) / 3.0
+		: (4.0 * C20_d[q - dev.offset2] - C20_d[q - 2 * dev.offset2]) / 3.0;
+	else
 	{
-		if (i > 0 && i < dev.nx && j > 0 && j < dev.ny && k > 0 && k < dev.nz)
-		{
-			vx_d[l] = ux_d[l] - dev.tau / 2.0 / dev.hx * (p_d[l + 1] - p_d[l - 1]);
-			vy_d[l] = uy_d[l] - dev.tau / 2.0 / dev.hy * (p_d[l + dev.offset] - p_d[l - dev.offset]);
-			vz_d[l] = uz_d[l] - dev.tau / 2.0 / dev.hz * (p_d[l + dev.offset2] - p_d[l - dev.offset2]);
-		}
-		else if (j == 0 && (i <= dev.nx && k <= dev.nz))
-		{
-			vx_d[l] = 0.0; vy_d[l] = 0.0; vz_d[l] = 0.0;
-		}
-		else if (j == dev.ny && (i <= dev.nx && k <= dev.nz))
-		{
-			vx_d[l] = 0.0; vy_d[l] = 0.0; vz_d[l] = 0.0;
-		}
-		else if (i == 0 && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))
-		{
-			int ll = dev.nx - 1 + dev.offset * j + dev.offset2 * k;
-			vx_d[l] = ux_d[ll] - dev.tau / 2.0 / dev.hx * (p_d[ll + 1] - p_d[ll - 1]);
-			vy_d[l] = uy_d[ll] - dev.tau / 2.0 / dev.hy * (p_d[ll + dev.offset] - p_d[ll - dev.offset]);
-			vz_d[l] = uz_d[ll] - dev.tau / 2.0 / dev.hz * (p_d[ll + dev.offset2] - p_d[ll - dev.offset2]);
-		}
-		else if (i == dev.nx && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))
-		{
-			int ll = 1 + dev.offset * j + dev.offset2 * k;
-			vx_d[l] = ux_d[ll] - dev.tau / 2.0 / dev.hx * (p_d[ll + 1] - p_d[ll - 1]);
-			vy_d[l] = uy_d[ll] - dev.tau / 2.0 / dev.hy * (p_d[ll + dev.offset] - p_d[ll - dev.offset]);
-			vz_d[l] = uz_d[ll] - dev.tau / 2.0 / dev.hz * (p_d[ll + dev.offset2] - p_d[ll - dev.offset2]);
-		}
-		else if (k == 0 && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))
-		{
-			int ll = i + dev.offset * j + dev.offset2 * dev.nz - dev.offset2;
-			vx_d[l] = ux_d[ll] - dev.tau / 2.0 / dev.hx * (p_d[ll + 1] - p_d[ll - 1]);
-			vy_d[l] = uy_d[ll] - dev.tau / 2.0 / dev.hy * (p_d[ll + dev.offset] - p_d[ll - dev.offset]);
-			vz_d[l] = uz_d[ll] - dev.tau / 2.0 / dev.hz * (p_d[ll + dev.offset2] - p_d[ll - dev.offset2]);
-		}
-		else if (k == dev.nz && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))
-		{
-			int ll = i + dev.offset * j + dev.offset2;
-			vx_d[l] = ux_d[ll] - dev.tau / 2.0 / dev.hx * (p_d[ll + 1] - p_d[ll - 1]);
-			vy_d[l] = uy_d[ll] - dev.tau / 2.0 / dev.hy * (p_d[ll + dev.offset] - p_d[ll - dev.offset]);
-			vz_d[l] = uz_d[ll] - dev.tau / 2.0 / dev.hz * (p_d[ll + dev.offset2] - p_d[ll - dev.offset2]);
-		}
+		const unsigned int inner = adjacent_interior(ii, dev.nx)
+			+ dev.offset * adjacent_interior(j, dev.ny)
+			+ dev.offset2 * adjacent_interior(kk, dev.nz);
+		C2_d[l] = C20_d[inner];
 	}
-
-	else if (i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N) {
-		int ii = i + 1 - i / dev.nx - ceil(i / (dev.nx + 1.0));
-		int jj = j + 1 - j / dev.ny - ceil(j / (dev.ny + 1.0));
-		int kk = k + 1 - k / dev.nz - ceil(k / (dev.nz + 1.0));
-
-		vx_d[l] = 0;
-		vy_d[l] = 0;
-		vz_d[l] = 0;
-
-	}
-
 }
 
+__global__ void velocity_correction(double* ux_d, double* uy_d, double* uz_d,
+	double* vx_d, double* vy_d, double* vz_d, double* p_d)
+{
+	const unsigned int i = threadIdx.x + blockIdx.x * blockDim.x;
+	const unsigned int j = threadIdx.y + blockIdx.y * blockDim.y;
+	const unsigned int k = threadIdx.z + blockIdx.z * blockDim.z;
+	const unsigned int l = i + dev.offset * j + dev.offset2 * k;
+	if (i > dev.nx || j > dev.ny || k > dev.nz || l >= dev.N) return;
+
+	const auto correct_velocity = [&](unsigned int ii, unsigned int jj, unsigned int kk)
+		{
+			const unsigned int q = ii + dev.offset * jj + dev.offset2 * kk;
+			vx_d[l] = ux_d[q] - dev.tau / (2.0 * dev.hx) * (p_d[q + 1] - p_d[q - 1]);
+			vy_d[l] = uy_d[q] - dev.tau / (2.0 * dev.hy) * (p_d[q + dev.offset] - p_d[q - dev.offset]);
+			vz_d[l] = uz_d[q] - dev.tau / (2.0 * dev.hz) * (p_d[q + dev.offset2] - p_d[q - dev.offset2]);
+		};
+
+	const bool wrap_x = dev.xbc == periodic;
+	const bool wrap_z = dev.zbc == periodic;
+	const unsigned int ii = wrap_x ? periodic_source(i, dev.nx) : i;
+	const unsigned int kk = wrap_z ? periodic_source(k, dev.nz) : k;
+	const bool inside_x = ii > 0 && ii < dev.nx;
+	const bool inside_y = j > 0 && j < dev.ny;
+	const bool inside_z = kk > 0 && kk < dev.nz;
+
+	if ((wrap_x || dev.xbc == closed) && (wrap_z || dev.zbc == closed) && inside_x && inside_y && inside_z)
+		correct_velocity(ii, j, kk);
+	else
+	{
+		vx_d[l] = 0.0;
+		vy_d[l] = 0.0;
+		vz_d[l] = 0.0;
+	}
+}
 
 __global__ void Poisson(double* ux_d, double* uy_d, double* uz_d, double* p_d, double* p0_d)
 {
-	//период условие отключено
-	unsigned int i = threadIdx.x + blockIdx.x * blockDim.x;
-	unsigned int j = threadIdx.y + blockIdx.y * blockDim.y;
-	unsigned int k = threadIdx.z + blockIdx.z * blockDim.z;
-	unsigned int l = i + dev.offset * j + dev.offset2 * k;
-	//double psiav0 = 0.0; double psiav = 0.0; double eps = 1.0; int k = 0;
+	const unsigned int i = threadIdx.x + blockIdx.x * blockDim.x;
+	const unsigned int j = threadIdx.y + blockIdx.y * blockDim.y;
+	const unsigned int k = threadIdx.z + blockIdx.z * blockDim.z;
+	const unsigned int l = i + dev.offset * j + dev.offset2 * k;
+	if (i > dev.nx || j > dev.ny || k > dev.nz || l >= dev.N) return;
 
-	/*
-
-	closed
-
-	*/
-
-	if (dev.xbc == closed && i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N)
-	{
-		if (i > 0 && i < dev.nx && j > 0 && j < dev.ny && k > 0 && k < dev.nz)
+	const bool closed_x = dev.xbc == closed;
+	const bool closed_z = dev.zbc == closed;
+	const bool wrap_x = dev.xbc == periodic;
+	const bool wrap_z = dev.zbc == periodic;
+	if ((!closed_x && !wrap_x) || (!closed_z && !wrap_z)) return;
+	const auto interior_pressure = [&](unsigned int ii, unsigned int jj, unsigned int kk)
 		{
-			p_d[l] =
-				-(ux_d[l + 1] - ux_d[l - 1]  /*/ dev.tau / 2.0 / dev.hx */
-					+ uy_d[l + dev.offset] - uy_d[l - dev.offset]  /* / dev.tau / 2.0 / dev.hy */
-					+ uz_d[l + dev.offset2] - uz_d[l - dev.offset2]) / dev.tau / 2.0 / dev.hz;
+			const unsigned int q = ii + dev.offset * jj + dev.offset2 * kk;
+			double correction = -(ux_d[q + 1] - ux_d[q - 1]) / (2.0 * dev.hx * dev.tau)
+				- (uy_d[q + dev.offset] - uy_d[q - dev.offset]) / (2.0 * dev.hy * dev.tau)
+				- (uz_d[q + dev.offset2] - uz_d[q - dev.offset2]) / (2.0 * dev.hz * dev.tau);
 
-			if (i == 1) 				p_d[l] += 2.0 / 3.0 / dev.hx / dev.hx * (p0_d[l + 1] - p0_d[l] - dev.hx / dev.tau * ux_d[l - 1]);
-			else if (i == dev.nx - 1) 	p_d[l] += 2.0 / 3.0 / dev.hx / dev.hx * (p0_d[l - 1] - p0_d[l] + dev.hx / dev.tau * ux_d[l + 1]);
-			else						p_d[l] += 1.0 / dev.hx / dev.hx * (p0_d[l + 1] + p0_d[l - 1] - 2.0 * p0_d[l]);
+			if (closed_x && ii == 1)
+				correction += 2.0 / 3.0 / dev.hx / dev.hx
+				* (p0_d[q + 1] - p0_d[q] - dev.hx / dev.tau * ux_d[q - 1]);
+			else if (closed_x && ii == dev.nx - 1)
+				correction += 2.0 / 3.0 / dev.hx / dev.hx
+				* (p0_d[q - 1] - p0_d[q] + dev.hx / dev.tau * ux_d[q + 1]);
+			else
+				correction += 1.0 / dev.hx / dev.hx * (p0_d[q + 1] + p0_d[q - 1] - 2.0 * p0_d[q]);
 
-			if (j == 1)					p_d[l] += 2.0 / 3.0 / dev.hy / dev.hy * (p0_d[l + dev.offset] - p0_d[l] - dev.hy / dev.tau * uy_d[l - dev.offset]);
-			else if (j == dev.ny - 1) 	p_d[l] += 2.0 / 3.0 / dev.hy / dev.hy * (p0_d[l - dev.offset] - p0_d[l] + dev.hy / dev.tau * uy_d[l + dev.offset]);
-			else						p_d[l] += 1.0 / dev.hy / dev.hy * (p0_d[l + dev.offset] + p0_d[l - dev.offset] - 2.0 * p0_d[l]);
+			if (jj == 1)
+				correction += 2.0 / 3.0 / dev.hy / dev.hy
+				* (p0_d[q + dev.offset] - p0_d[q] - dev.hy / dev.tau * uy_d[q - dev.offset]);
+			else if (jj == dev.ny - 1)
+				correction += 2.0 / 3.0 / dev.hy / dev.hy
+				* (p0_d[q - dev.offset] - p0_d[q] + dev.hy / dev.tau * uy_d[q + dev.offset]);
+			else
+				correction += 1.0 / dev.hy / dev.hy
+				* (p0_d[q + dev.offset] + p0_d[q - dev.offset] - 2.0 * p0_d[q]);
 
-			if (k == 1)					p_d[l] += 2.0 / 3.0 / dev.hz / dev.hz * (p0_d[l + dev.offset2] - p0_d[l] - dev.hz / dev.tau * uz_d[l - dev.offset2]);
-			else if (k == dev.nz - 1)		p_d[l] += 2.0 / 3.0 / dev.hz / dev.hz * (p0_d[l - dev.offset2] - p0_d[l] + dev.hz / dev.tau * uz_d[l + dev.offset2]);
-			else						p_d[l] += 1.0 / dev.hz / dev.hz * (p0_d[l + dev.offset2] + p0_d[l - dev.offset2] - 2.0 * p0_d[l]);
+			if (closed_z && kk == 1)
+				correction += 2.0 / 3.0 / dev.hz / dev.hz
+				* (p0_d[q + dev.offset2] - p0_d[q] - dev.hz / dev.tau * uz_d[q - dev.offset2]);
+			else if (closed_z && kk == dev.nz - 1)
+				correction += 2.0 / 3.0 / dev.hz / dev.hz
+				* (p0_d[q - dev.offset2] - p0_d[q] + dev.hz / dev.tau * uz_d[q + dev.offset2]);
+			else
+				correction += 1.0 / dev.hz / dev.hz
+				* (p0_d[q + dev.offset2] + p0_d[q - dev.offset2] - 2.0 * p0_d[q]);
 
-			p_d[l] *= dev.tau_p;
-			p_d[l] += p0_d[l];
-		}
+			correction *= dev.tau_p;
+			return correction + p0_d[q];
+		};
 
+	const unsigned int ii = wrap_x ? periodic_source(i, dev.nx) : i;
+	const unsigned int kk = wrap_z ? periodic_source(k, dev.nz) : k;
+	const bool inside_x = ii > 0 && ii < dev.nx;
+	const bool inside_y = j > 0 && j < dev.ny;
+	const bool inside_z = kk > 0 && kk < dev.nz;
+	const unsigned int q = ii + dev.offset * j + dev.offset2 * kk;
 
-		else if (j == 0 && (i > 0 && i < dev.nx && k > 0 && k < dev.nz))		p_d[l] = (4.0 * p0_d[l + dev.offset] - p0_d[l + dev.offset * 2]) / 3.0 - uy_d[l] * 2.0 * dev.hy / dev.tau / 3.0;
-		else if (j == dev.ny && (i > 0 && i < dev.nx && k > 0 && k < dev.nz))		p_d[l] = (4.0 * p0_d[l - dev.offset] - p0_d[l - dev.offset * 2]) / 3.0 + uy_d[l] * 2.0 * dev.hy / dev.tau / 3.0;
-		else if (i == 0 && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))		p_d[l] = (4.0 * p0_d[l + 1] - p0_d[l + 2]) / 3.0 - ux_d[l] * 2.0 * dev.hx / dev.tau / 3.0;
-		else if (i == dev.nx && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))		p_d[l] = (4.0 * p0_d[l - 1] - p0_d[l - 2]) / 3.0 + ux_d[l] * 2.0 * dev.hx / dev.tau / 3.0;
-		else if (k == 0 && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		p_d[l] = (4.0 * p0_d[l + dev.offset2] - p0_d[l + dev.offset2 * 2]) / 3.0 - uz_d[l] * 2.0 * dev.hz / dev.tau / 3.0;
-		else if (k == dev.nz && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		p_d[l] = (4.0 * p0_d[l - dev.offset2] - p0_d[l - dev.offset2 * 2]) / 3.0 + uz_d[l] * 2.0 * dev.hz / dev.tau / 3.0;
-
-		else if (i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N) {
-			int ii = i + 1 - i / dev.nx - ceil(i / (dev.nx + 1.0));
-			int jj = j + 1 - j / dev.ny - ceil(j / (dev.ny + 1.0));
-			int kk = k + 1 - k / dev.nz - ceil(k / (dev.nz + 1.0));
-			p_d[l] = p0_d[ii + dev.offset * jj + dev.offset2 * kk];
-			//p_d[l] = 0;
-			//int ii = 0;
-			//int jj = 0;
-			//int kk = 0;
-
-			//if (i == 0)	ii = 1;		if (i == dev.nx) ii = -1;
-			//if (j == 0)	jj = 1;		if (j == dev.ny) jj = -1;
-			//if (k == 0)	kk = 1;		if (k == dev.nz) kk = -1;
-
-			//p_d[l] = (4.0*p0_d[l + 1 * ii + dev.offset*jj + dev.offset2*kk] - p0_d[l + 2 * ii + dev.offset*jj + dev.offset2*kk]) / 3.0
-			//	- ii* ux_d[l] * 2.0 / 3.0*dev.hx / dev.tau
-			//	- jj* uy_d[l] * 2.0 / 3.0*dev.hy / dev.tau
-			//	- kk* uz_d[l] * 2.0 / 3.0*dev.hz / dev.tau;
-		}
-	}
-
-	/*
-
-	periodic
-
-	*/
-
-
-	else if (dev.xbc == periodic && i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N)
+	if (inside_x && inside_y && inside_z)
+		p_d[l] = interior_pressure(ii, j, kk);
+	else if (j == 0 && inside_x && inside_z)
+		p_d[l] = (4.0 * p0_d[q + dev.offset] - p0_d[q + 2 * dev.offset]) / 3.0
+		- uy_d[q] * 2.0 / 3.0 * dev.hy / dev.tau;
+	else if (j == dev.ny && inside_x && inside_z)
+		p_d[l] = (4.0 * p0_d[q - dev.offset] - p0_d[q - 2 * dev.offset]) / 3.0
+		+ uy_d[q] * 2.0 / 3.0 * dev.hy / dev.tau;
+	else if (closed_x && i == 0 && inside_y && inside_z)
+		p_d[l] = (4.0 * p0_d[q + 1] - p0_d[q + 2]) / 3.0 - ux_d[q] * 2.0 * dev.hx / dev.tau / 3.0;
+	else if (closed_x && i == dev.nx && inside_y && inside_z)
+		p_d[l] = (4.0 * p0_d[q - 1] - p0_d[q - 2]) / 3.0 + ux_d[q] * 2.0 * dev.hx / dev.tau / 3.0;
+	else if (closed_z && k == 0 && inside_x && inside_y)
+		p_d[l] = (4.0 * p0_d[q + dev.offset2] - p0_d[q + 2 * dev.offset2]) / 3.0
+		- uz_d[q] * 2.0 * dev.hz / dev.tau / 3.0;
+	else if (closed_z && k == dev.nz && inside_x && inside_y)
+		p_d[l] = (4.0 * p0_d[q - dev.offset2] - p0_d[q - 2 * dev.offset2]) / 3.0
+		+ uz_d[q] * 2.0 * dev.hz / dev.tau / 3.0;
+	else
 	{
-		if (i > 0 && i < dev.nx && j > 0 && j < dev.ny && k > 0 && k < dev.nz)
-		{
-			p_d[l] =
-				-(ux_d[l + 1] - ux_d[l - 1]  /*/ dev.tau / 2.0 / dev.hx */
-					+ uy_d[l + dev.offset] - uy_d[l - dev.offset]  /* / dev.tau / 2.0 / dev.hy */
-					+ uz_d[l + dev.offset2] - uz_d[l - dev.offset2]) / dev.tau / 2.0 / dev.hz;
-
-			/*if (i == 1) 				p_d[l] += 2.0 / 3.0 / dev.hx / dev.hx*(p0_d[l + 1] - p0_d[l] - dev.hx / dev.tau*ux_d[l - 1]);
-			else if (i == dev.nx - 1) 	p_d[l] += 2.0 / 3.0 / dev.hx / dev.hx*(p0_d[l - 1] - p0_d[l] + dev.hx / dev.tau*ux_d[l + 1]);
-			else*/						p_d[l] += 1.0 / dev.hx / dev.hx * (p0_d[l + 1] + p0_d[l - 1] - 2.0 * p0_d[l]);
-
-			if (j == 1)					p_d[l] += 2.0 / 3.0 / dev.hy / dev.hy * (p0_d[l + dev.offset] - p0_d[l] - dev.hy / dev.tau * uy_d[l - dev.offset]);
-			else if (j == dev.ny - 1) 	p_d[l] += 2.0 / 3.0 / dev.hy / dev.hy * (p0_d[l - dev.offset] - p0_d[l] + dev.hy / dev.tau * uy_d[l + dev.offset]);
-			else						p_d[l] += 1.0 / dev.hy / dev.hy * (p0_d[l + dev.offset] + p0_d[l - dev.offset] - 2.0 * p0_d[l]);
-
-			/*if (k == 1)					p_d[l] += 2.0 / 3.0 / dev.hz / dev.hz*(p0_d[l + dev.offset2] - p0_d[l] - dev.hz / dev.tau*uz_d[l - dev.offset2]);
-			//else if (k == dev.nz - 1)		p_d[l] += 2.0 / 3.0 / dev.hz / dev.hz*(p0_d[l - dev.offset2] - p0_d[l] + dev.hz / dev.tau*uz_d[l + dev.offset2]);
-			*/							p_d[l] += 1.0 / dev.hz / dev.hz * (p0_d[l + dev.offset2] + p0_d[l - dev.offset2] - 2.0 * p0_d[l]);
-
-			p_d[l] *= dev.tau_p;
-			p_d[l] += p0_d[l];
-		}
-
-		else if (j == 0 && (i > 0 && i < dev.nx && k <= dev.nz))		p_d[l] = (4.0 * p0_d[l + dev.offset] - p0_d[l + dev.offset * 2]) / 3.0 - uy_d[l] * 2.0 / 3.0 * dev.hy / dev.tau;
-		else if (j == dev.ny && (i > 0 && i < dev.nx && k <= dev.nz))	p_d[l] = (4.0 * p0_d[l - dev.offset] - p0_d[l - dev.offset * 2]) / 3.0 + uy_d[l] * 2.0 / 3.0 * dev.hy / dev.tau;
-		else if (i == 0 && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))		p_d[l] = p0_d[dev.nx - 1 + dev.offset * j + dev.offset2 * k];
-		else if (i == dev.nx && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))		p_d[l] = p0_d[1 + dev.offset * j + dev.offset2 * k];
-		else if (k == 0 && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		p_d[l] = p0_d[i + dev.offset * j + dev.offset2 * dev.nz - dev.offset2];
-		else if (k == dev.nz && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		p_d[l] = p0_d[i + dev.offset * j + dev.offset2];
-
-		else if (i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N) {
-
-			int ii = i + 1 - i / dev.nx - ceil(i / (dev.nx + 1.0));
-			int jj = j + 1 - j / dev.ny - ceil(j / (dev.ny + 1.0));
-			int kk = k + 1 - k / dev.nz - ceil(k / (dev.nz + 1.0));
-			p_d[l] = p0_d[ii + dev.offset * jj + dev.offset2 * kk];
-			//int ii = 0;
-			//int jj = 0;
-			//int kk = 0;
-
-			//if (i == 0)	ii = 1;		if (i == dev.nx) ii = -1;
-			//if (j == 0)	jj = 1;		if (j == dev.ny) jj = -1;
-			//if (k == 0)	kk = 1;		if (k == dev.nz) kk = -1;
-
-			//p_d[l] = (4.0*p0_d[l + 1 * ii + dev.offset*jj + dev.offset2*kk] - p0_d[l + 2 * ii + dev.offset*jj + dev.offset2*kk]) / 3.0
-			//	- ii* ux_d[l] * 2.0 / 3.0*dev.hx / dev.tau
-			//	- jj* uy_d[l] * 2.0 / 3.0*dev.hy / dev.tau
-			//	- kk* uz_d[l] * 2.0 / 3.0*dev.hz / dev.tau;
-		}
+		const unsigned int inner = adjacent_interior(ii, dev.nx)
+			+ dev.offset * adjacent_interior(j, dev.ny)
+			+ dev.offset2 * adjacent_interior(kk, dev.nz);
+		p_d[l] = p0_d[inner];
 	}
-
 }
 
-__global__ void Poisson_v2(double* ux_d, double* uy_d, double* uz_d, double* p_d, double* p0_d, int order)
-{
-	//период условие отключено
-	unsigned int i = threadIdx.x + blockIdx.x * blockDim.x;
-	unsigned int j = threadIdx.y + blockIdx.y * blockDim.y;
-	unsigned int k = threadIdx.z + blockIdx.z * blockDim.z;
-	unsigned int l = i + dev.offset * j + dev.offset2 * k;
-	//double psiav0 = 0.0; double psiav = 0.0; double eps = 1.0; int k = 0;
-
-	if ((i + j) % 2 == order) return;
-
-	/*
-
-	closed
-
-	*/
-
-	if (dev.xbc == closed && i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N)
-	{
-		if (i > 0 && i < dev.nx && j > 0 && j < dev.ny && k > 0 && k < dev.nz)
-		{
-			p_d[l] =
-				-(ux_d[l + 1] - ux_d[l - 1]  /*/ dev.tau / 2.0 / dev.hx */
-					+ uy_d[l + dev.offset] - uy_d[l - dev.offset]  /* / dev.tau / 2.0 / dev.hy */
-					+ uz_d[l + dev.offset2] - uz_d[l - dev.offset2]) / dev.tau / 2.0 / dev.hz;
-
-			if (i == 1) 				p_d[l] += 2.0 / 3.0 / dev.hx / dev.hx * (p0_d[l + 1] - p0_d[l] - dev.hx / dev.tau * ux_d[l - 1]);
-			else if (i == dev.nx - 1) 	p_d[l] += 2.0 / 3.0 / dev.hx / dev.hx * (p0_d[l - 1] - p0_d[l] + dev.hx / dev.tau * ux_d[l + 1]);
-			else						p_d[l] += 1.0 / dev.hx / dev.hx * (p0_d[l + 1] + p0_d[l - 1] - 2.0 * p0_d[l]);
-
-			if (j == 1)					p_d[l] += 2.0 / 3.0 / dev.hy / dev.hy * (p0_d[l + dev.offset] - p0_d[l] - dev.hy / dev.tau * uy_d[l - dev.offset]);
-			else if (j == dev.ny - 1) 	p_d[l] += 2.0 / 3.0 / dev.hy / dev.hy * (p0_d[l - dev.offset] - p0_d[l] + dev.hy / dev.tau * uy_d[l + dev.offset]);
-			else						p_d[l] += 1.0 / dev.hy / dev.hy * (p0_d[l + dev.offset] + p0_d[l - dev.offset] - 2.0 * p0_d[l]);
-
-			if (k == 1)					p_d[l] += 2.0 / 3.0 / dev.hz / dev.hz * (p0_d[l + dev.offset2] - p0_d[l] - dev.hz / dev.tau * uz_d[l - dev.offset2]);
-			else if (k == dev.nz - 1)		p_d[l] += 2.0 / 3.0 / dev.hz / dev.hz * (p0_d[l - dev.offset2] - p0_d[l] + dev.hz / dev.tau * uz_d[l + dev.offset2]);
-			else						p_d[l] += 1.0 / dev.hz / dev.hz * (p0_d[l + dev.offset2] + p0_d[l - dev.offset2] - 2.0 * p0_d[l]);
-
-			p_d[l] *= dev.tau_p;
-			p_d[l] += p0_d[l];
-		}
-
-
-		else if (j == 0 && (i > 0 && i < dev.nx && k > 0 && k < dev.nz))		p_d[l] = (4.0 * p0_d[l + dev.offset] - p0_d[l + dev.offset * 2]) / 3.0 - uy_d[l] * 2.0 * dev.hy / dev.tau / 3.0;
-		else if (j == dev.ny && (i > 0 && i < dev.nx && k > 0 && k < dev.nz))		p_d[l] = (4.0 * p0_d[l - dev.offset] - p0_d[l - dev.offset * 2]) / 3.0 + uy_d[l] * 2.0 * dev.hy / dev.tau / 3.0;
-		else if (i == 0 && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))		p_d[l] = (4.0 * p0_d[l + 1] - p0_d[l + 2]) / 3.0 - ux_d[l] * 2.0 * dev.hx / dev.tau / 3.0;
-		else if (i == dev.nx && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))		p_d[l] = (4.0 * p0_d[l - 1] - p0_d[l - 2]) / 3.0 + ux_d[l] * 2.0 * dev.hx / dev.tau / 3.0;
-		else if (k == 0 && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		p_d[l] = (4.0 * p0_d[l + dev.offset2] - p0_d[l + dev.offset2 * 2]) / 3.0 - uz_d[l] * 2.0 * dev.hz / dev.tau / 3.0;
-		else if (k == dev.nz && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		p_d[l] = (4.0 * p0_d[l - dev.offset2] - p0_d[l - dev.offset2 * 2]) / 3.0 + uz_d[l] * 2.0 * dev.hz / dev.tau / 3.0;
-
-		else if (i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N) {
-			int ii = i + 1 - i / dev.nx - ceil(i / (dev.nx + 1.0));
-			int jj = j + 1 - j / dev.ny - ceil(j / (dev.ny + 1.0));
-			int kk = k + 1 - k / dev.nz - ceil(k / (dev.nz + 1.0));
-			p_d[l] = p0_d[ii + dev.offset * jj + dev.offset2 * kk];
-		}
-	}
-
-	/*
-
-	periodic
-
-	*/
-
-
-	else if (dev.xbc == periodic && i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N)
-	{
-		if (i > 0 && i < dev.nx && j > 0 && j < dev.ny && k > 0 && k < dev.nz)
-		{
-			p_d[l] =
-				-(ux_d[l + 1] - ux_d[l - 1]  /*/ dev.tau / 2.0 / dev.hx */
-					+ uy_d[l + dev.offset] - uy_d[l - dev.offset]  /* / dev.tau / 2.0 / dev.hy */
-					+ uz_d[l + dev.offset2] - uz_d[l - dev.offset2]) / dev.tau / 2.0 / dev.hz;
-
-			/*if (i == 1) 				p_d[l] += 2.0 / 3.0 / dev.hx / dev.hx*(p0_d[l + 1] - p0_d[l] - dev.hx / dev.tau*ux_d[l - 1]);
-			else if (i == dev.nx - 1) 	p_d[l] += 2.0 / 3.0 / dev.hx / dev.hx*(p0_d[l - 1] - p0_d[l] + dev.hx / dev.tau*ux_d[l + 1]);
-			else*/						p_d[l] += 1.0 / dev.hx / dev.hx * (p0_d[l + 1] + p0_d[l - 1] - 2.0 * p0_d[l]);
-
-			if (j == 1)					p_d[l] += 2.0 / 3.0 / dev.hy / dev.hy * (p0_d[l + dev.offset] - p0_d[l] - dev.hy / dev.tau * uy_d[l - dev.offset]);
-			else if (j == dev.ny - 1) 	p_d[l] += 2.0 / 3.0 / dev.hy / dev.hy * (p0_d[l - dev.offset] - p0_d[l] + dev.hy / dev.tau * uy_d[l + dev.offset]);
-			else						p_d[l] += 1.0 / dev.hy / dev.hy * (p0_d[l + dev.offset] + p0_d[l - dev.offset] - 2.0 * p0_d[l]);
-
-			/*if (k == 1)					p_d[l] += 2.0 / 3.0 / dev.hz / dev.hz*(p0_d[l + dev.offset2] - p0_d[l] - dev.hz / dev.tau*uz_d[l - dev.offset2]);
-			//else if (k == dev.nz - 1)		p_d[l] += 2.0 / 3.0 / dev.hz / dev.hz*(p0_d[l - dev.offset2] - p0_d[l] + dev.hz / dev.tau*uz_d[l + dev.offset2]);
-			*/							p_d[l] += 1.0 / dev.hz / dev.hz * (p0_d[l + dev.offset2] + p0_d[l - dev.offset2] - 2.0 * p0_d[l]);
-
-			p_d[l] *= dev.tau_p;
-			p_d[l] += p0_d[l];
-		}
-
-		else if (j == 0 && (i > 0 && i < dev.nx && k <= dev.nz))		p_d[l] = (4.0 * p0_d[l + dev.offset] - p0_d[l + dev.offset * 2]) / 3.0 - uy_d[l] * 2.0 / 3.0 * dev.hy / dev.tau;
-		else if (j == dev.ny && (i > 0 && i < dev.nx && k <= dev.nz))	p_d[l] = (4.0 * p0_d[l - dev.offset] - p0_d[l - dev.offset * 2]) / 3.0 + uy_d[l] * 2.0 / 3.0 * dev.hy / dev.tau;
-		else if (i == 0 && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))		p_d[l] = p0_d[dev.nx - 1 + dev.offset * j + dev.offset2 * k];
-		else if (i == dev.nx && (j > 0 && j < dev.ny && k > 0 && k < dev.nz))		p_d[l] = p0_d[1 + dev.offset * j + dev.offset2 * k];
-		else if (k == 0 && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		p_d[l] = p0_d[i + dev.offset * j + dev.offset2 * dev.nz - dev.offset2];
-		else if (k == dev.nz && (i > 0 && i < dev.nx && j > 0 && j < dev.ny))		p_d[l] = p0_d[i + dev.offset * j + dev.offset2];
-
-		else if (i <= dev.nx && j <= dev.ny && k <= dev.nz && l < dev.N) {
-
-			int ii = i + 1 - i / dev.nx - ceil(i / (dev.nx + 1.0));
-			int jj = j + 1 - j / dev.ny - ceil(j / (dev.ny + 1.0));
-			int kk = k + 1 - k / dev.nz - ceil(k / (dev.nz + 1.0));
-			p_d[l] = p0_d[ii + dev.offset * jj + dev.offset2 * kk];
-		}
-	}
-
-}
 
 
 

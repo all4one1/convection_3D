@@ -37,8 +37,6 @@ int main(int argc, char** argv)
 	const bool smoke_test = argc == 2 && std::string(argv[1]) == "--smoke-test";
 	init_parameters(host, run);
 
-
-
 	GPU_ gpu(0);
 	Arrays h{}, d{};
 	StatValues stats{};
@@ -117,9 +115,9 @@ int main(int argc, char** argv)
 
 			run.next_iter(host.tau);
 			if (run.timeq > run.timeq_max) run.stop_signal = 1;
-
-
 			solver.proceed_binary_fixed_temperature();
+
+
 
 			//metrics output
 			if (run.every_time(host.tau, run.freq_metrics) || run.iter == 1)

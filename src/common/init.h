@@ -32,11 +32,12 @@ void init_parameters(Configuration& c, RUN_STATE& state)
 	//addFolder("final", folder_final);
 	//addFolder("lines", folder_lines);
 
-	const ReadingFile par("parameters.txt");
+	ReadingFile par("parameters.txt");
 	state.read_recovery = par.required<int>("read_recovery");
 	state.timeq_min = par.required<double>("timeq_min");
 	state.timeq_max = par.required<double>("timeq_max");
 	state.freq_fields = par.required<double>("freq_fields");
+	par.reading(state.freq_metrics, "freq_metrics", 1.0);
 	state.call_max = par.required<int>("call_max");
 
 	c.Lx = par.required<double>("Lx");
@@ -72,9 +73,9 @@ void init_parameters(Configuration& c, RUN_STATE& state)
 
 	c.dim = 3;
 	c.disc = FD;
-	c.hx = c.Lx / static_cast<double>(c.nx);
+	c.hx = c.Lx / static_cast<double>(c.nx - (c.xbc == periodic ? 1 : 0));
 	c.hy = c.Ly / static_cast<double>(c.ny);
-	c.hz = c.Lz / static_cast<double>(c.nz);
+	c.hz = c.Lz / static_cast<double>(c.nz - (c.zbc == periodic ? 1 : 0));
 	c.Sx = c.hy * c.hz;
 	c.Sy = c.hx * c.hz;
 	c.Sz = c.hx * c.hy;
@@ -90,7 +91,7 @@ void init_parameters(Configuration& c, RUN_STATE& state)
 	c.offset2 = static_cast<unsigned int>(plane_size);
 	c.N = static_cast<unsigned int>(count);
 	c.Nbytes = count * sizeof(double);
-	c.tau_p = 0.1 * c.hx * c.hx;
+	c.tau_p = 0.25 / (1.0 / (c.hx * c.hx) + 1.0 / (c.hy * c.hy) + 1.0 / (c.hz * c.hz));
 	c.psi2 = c.psiS - c.psi1;
 
 	constexpr double pi = 3.1415926535897932384626433832795;
@@ -110,6 +111,48 @@ void init_parameters(Configuration& c, RUN_STATE& state)
 
 void copy_fields_to_device(const Configuration& c, const Arrays& h, Arrays& d)
 {
+	// Restart files may contain periodic ghosts from an earlier time level.
+	auto refresh_periodic_planes = [&](double* field, bool wrap_x, bool wrap_z)
+		{
+			if (wrap_x)
+				for (unsigned int k = 0; k <= c.nz; ++k)
+					for (unsigned int j = 0; j <= c.ny; ++j)
+					{
+						double* row = field + c.offset * j + c.offset2 * k;
+						row[0] = row[c.nx - 1];
+						row[c.nx] = row[1];
+					}
+			if (wrap_z)
+			{
+				std::copy_n(field + c.offset2 * (c.nz - 1), c.offset2, field);
+				std::copy_n(field + c.offset2, c.offset2, field + c.offset2 * c.nz);
+			}
+		};
+	const bool wrap_x = c.xbc == periodic;
+	const bool wrap_z = c.zbc == periodic;
+	refresh_periodic_planes(h.T, wrap_x, wrap_z);
+	refresh_periodic_planes(h.C, wrap_x, wrap_z);
+	refresh_periodic_planes(h.C2, wrap_x, wrap_z);
+	refresh_periodic_planes(h.p, wrap_x, wrap_z);
+	for (double* velocity : { h.vx, h.vy, h.vz })
+	{
+		// Legacy mixed-boundary restarts may have nonzero velocity on solid faces.
+		if (c.xbc == closed)
+			for (unsigned int k = 0; k <= c.nz; ++k)
+				for (unsigned int j = 0; j <= c.ny; ++j)
+				{
+					double* row = velocity + c.offset * j + c.offset2 * k;
+					row[0] = 0.0;
+					row[c.nx] = 0.0;
+				}
+		if (c.zbc == closed)
+		{
+			std::fill_n(velocity, c.offset2, 0.0);
+			std::fill_n(velocity + c.offset2 * c.nz, c.offset2, 0.0);
+		}
+		refresh_periodic_planes(velocity, wrap_x, wrap_z);
+	}
+
 	copyArrayFromHostToDevice({ d.T, d.T0 }, h.T, c.N);
 	copyArrayFromHostToDevice({ d.p, d.p0 }, h.p, c.N);
 	copyArrayFromHostToDevice({ d.ux, d.vx }, h.vx, c.N);
@@ -119,7 +162,7 @@ void copy_fields_to_device(const Configuration& c, const Arrays& h, Arrays& d)
 	copyArrayFromHostToDevice({ d.C2, d.C20 }, h.C2, c.N);
 }
 
-void copy_fields_to_host(const Configuration& c, Arrays& h, const Arrays& d, int &already_copied)
+void copy_fields_to_host(const Configuration& c, Arrays& h, const Arrays& d, int& already_copied)
 {
 	if (already_copied) return;
 	cudaMemcpy(h.T, d.T, c.Nbytes, cudaMemcpyDeviceToHost);
@@ -150,7 +193,7 @@ void init_fields(const Configuration& c, Arrays& h, Arrays& d)
 			for (unsigned int i = 0; i <= c.nx; ++i)
 			{
 				const unsigned int q = i + c.offset * j + c.offset2 * k;
-				h.C2[q] = 1e-5 * std::sin(2.0 * pi * i * c.hx / c.Lx) *std::sin(2.0 * pi * k * c.hz / c.Lz) *	(1.0 - c.hy * j) * c.psi2;
+				h.C2[q] = 1e-5 * std::sin(2.0 * pi * i * c.hx / c.Lx) * std::sin(2.0 * pi * k * c.hz / c.Lz) * (1.0 - c.hy * j) * c.psi2;
 			}
 		}
 	}
@@ -158,47 +201,27 @@ void init_fields(const Configuration& c, Arrays& h, Arrays& d)
 	copy_fields_to_device(c, h, d);
 }
 
+// Periodic directions have two ghost planes and nx-1 / nz-1 unique points.
 void init_fields_conductive_state(const Configuration& c, Arrays& h, Arrays& d)
 {
-	std::fill_n(h.T, c.N, 0.0);
-	std::fill_n(h.p, c.N, 0.0);
 	std::fill_n(h.vx, c.N, 0.0);
 	std::fill_n(h.vy, c.N, 0.0);
 	std::fill_n(h.vz, c.N, 0.0);
-	std::fill_n(h.C, c.N, 0.0);
-	std::fill_n(h.C2, c.N, 0.0);
-
 	constexpr double pi = 3.1415926535897932384626433832795;
-	constexpr double eps = 1e-5;
-
 	for (unsigned int k = 0; k <= c.nz; ++k)
-	{
 		for (unsigned int j = 0; j <= c.ny; ++j)
-		{
 			for (unsigned int i = 0; i <= c.nx; ++i)
 			{
 				const unsigned int q = i + c.offset * j + c.offset2 * k;
-
-				const double x = i * c.hx;
+				const double x = (static_cast<double>(i) - (c.xbc == periodic ? 1.0 : 0.0)) * c.hx;
+				const double z = (static_cast<double>(k) - (c.zbc == periodic ? 1.0 : 0.0)) * c.hz;
 				const double y = j * c.hy;
-
-				// Проводящее состояние
-				h.T[q] = 1.0 - y / c.Ly;
-				h.p[q] = 0.0;  // давление установит проекционный шаг
-				h.vx[q] = 0.0;
-				h.vy[q] = 0.0;
-				h.vz[q] = 0.0;
-
-				// Соретовы проводящие профили, среднее по слою равно нулю
-				h.C[q] = c.psi1 * c.Q * (y - 0.5 * c.Ly);
-				h.C2[q] = c.psi2 * c.Q * (y - 0.5 * c.Ly)
-
-					// Малое возмущение критической 2D-моды kx = pi, kz = 0
-					+ eps * std::sin(2.0 * pi * x / c.Lx)
-					* std::cos(pi * y / c.Ly);
+				h.T[q] = c.Q * (y - 0.5 * c.Ly);
+				h.C[q] = c.psi1 * h.T[q];
+				// seed as in PoF 38, 064104 (2026): 1e-5*sin(2pi x/Lx)*sin(2pi y/Ly)*(1-z)*psi
+				h.C2[q] = c.psi2 * h.T[q] + 1e-5 * std::sin(2 * pi * x / c.Lx)
+					* std::sin(2 * pi * y / c.Ly) * (1.0 - y) * c.psiS;
+				h.p[q] = c.Ra / c.Pr * (1 + c.psiS) * c.Q * (0.5 * y * y - 0.5 * c.Ly * y);
 			}
-		}
-	}
-
 	copy_fields_to_device(c, h, d);
 }

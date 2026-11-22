@@ -17,7 +17,11 @@ struct OutputMetrics
 	double vzmax = 0;
 	double pressure_max = 0;
 	double Nu = 0;
-	double Sh = 0;
+	double ShC2 = 0;   // 1/(mean C2 bottom - mean C2 top): 1/psi2 at rest
+	double ShC1 = 0;   // 1/(mean C1 bottom - mean C1 top): 1/psi1 at rest
+
+	double mean_wT = 0, mean_wC1 = 0, mean_wC2 = 0; 	// volume means of w*T, w*C1, w*C2 - buoyancy power decomposition:
+	double DTmax = 0, DCmax = 0;
 	double Tmax_xz = 0;
 	double Txm = 0;
 	double Tzm = 0;
@@ -34,6 +38,9 @@ struct OutputMetrics
 	double Ek_change = 0;
 	double Ek_change_abs = 0;
 	double Ek_change_relative = 0;
+
+	// maximum |div v| over inner nodes (incompressibility / projection quality)
+	double divergence_max = 0;
 };
 
 inline unsigned int field_index(const Configuration& c, unsigned int i, unsigned int j, unsigned int k)
@@ -54,7 +61,10 @@ inline OutputMetrics collect_output_metrics(const Configuration& c, const Arrays
 	metrics.pressure_max = max_abs(h.p, c.N);
 
 	Nu_y_for_fixed_flux(c, h.T, metrics.Nu);
-	Nu_y_for_fixed_flux(c, h.C2, metrics.Sh);
+	Nu_y_for_fixed_flux(c, h.C2, metrics.ShC2);
+	Nu_y_for_fixed_flux(c, h.C, metrics.ShC1);
+	metrics.DTmax = max_vertical_difference(c, h.T);
+	metrics.DCmax = max_vertical_difference(c, h.C2);
 
 	unsigned int i, k;
 	find_max_abs_xz_section_with_index(c, h.T, i, k, metrics.Tmax_xz);
@@ -69,7 +79,7 @@ inline OutputMetrics collect_output_metrics(const Configuration& c, const Arrays
 	stats.Cm = max_abs(h.C2, c.N);
 	angular_momentum(c, h.vx, h.vy, h.vz, stats.AMx, stats.AMy, stats.AMz, stats.AM);
 
-	metrics.vy_control = h.vy[field_index(c, 10, 10, 10)];
+	metrics.vy_control = h.vy[field_index(c, c.nx / 4, c.ny / 2, c.nz / 4)];
 	const unsigned int center = field_index(c, c.nx / 2, c.ny / 2, c.nz / 2);
 	const unsigned int quarter = field_index(c, c.nx / 4, c.ny / 4, c.nz / 4);
 	metrics.center_vy = h.vy[center];
@@ -82,6 +92,23 @@ inline OutputMetrics collect_output_metrics(const Configuration& c, const Arrays
 	metrics.Ek_change = stats.Ek - stats.Ek_old;
 	metrics.Ek_change_abs = std::abs(metrics.Ek_change);
 	metrics.Ek_change_relative = metrics.Ek_change_abs / stats.Ek_old;
+	constexpr double pi = 3.1415926535897932384626433832795;
+
+	const double horizontal_count = (c.nx - 1.0) * (c.nz - 1.0);
+
+	double wt = 0, wc1 = 0, wc2 = 0;
+	for (unsigned int kk = 1; kk < c.nz; ++kk)
+		for (unsigned int jj = 1; jj < c.ny; ++jj)
+			for (unsigned int ii = 1; ii < c.nx; ++ii)
+			{
+				const unsigned int l = field_index(c, ii, jj, kk);
+				wt += h.vy[l] * h.T[l];
+				wc1 += h.vy[l] * h.C[l];
+				wc2 += h.vy[l] * h.C2[l];
+			}
+	metrics.mean_wT = wt * c.dV;
+	metrics.mean_wC1 = wc1 * c.dV;
+	metrics.mean_wC2 = wc2 * c.dV;
 
 	return metrics;
 }
@@ -111,8 +138,8 @@ inline void write_integrals_row(std::ostream& integrals, const Configuration& c,
 	if (run.iter == 1)
 	{
 		integrals << "t, Ek, Vmax,  time(min), Vc, Tc, Cc, Vq, Tq, Cq, dEk, dEkRel, AMx, AMy, AMz, AMabs, vxmax, vymax, vzmax, ";
-		integrals << "Nu, Sh, Tmax_xm, Txm, Tzm, Vmax_xm, Vxm, Vzm, ";
-		integrals << "Ra=" << c.Ra << '\n';
+		integrals << "Nu, ShC2, ShC1, Tmax_xm, Txm, Tzm, Vmax_xm, Vxm, Vzm, ";
+		integrals << "w_mode1x_cos, w_mode1x_sin, w_mode1z_cos, w_mode1z_sin, c1_dev_rms, divergence_max, mean_wT, mean_wC1, mean_wC2, DTmax, DCmax, Ra=" << c.Ra << '\n';
 	}
 
 	integrals << std::setprecision(20) << std::fixed;
@@ -122,9 +149,12 @@ inline void write_integrals_row(std::ostream& integrals, const Configuration& c,
 	integrals << metrics.Ek_change_abs << " " << metrics.Ek_change_relative << " ";
 	integrals << stats.AMx << " " << stats.AMy << " " << stats.AMz << " " << stats.AM << " ";
 	integrals << metrics.vxmax << " " << metrics.vymax << " " << metrics.vzmax << " ";
-	integrals << metrics.Nu << " " << metrics.Sh << " ";
+	integrals << metrics.Nu << " " << metrics.ShC2 << " " << metrics.ShC1 << " ";
 	integrals << metrics.Tmax_xz << " " << metrics.Txm << " " << metrics.Tzm << " ";
-	integrals << metrics.Vmax_xz << " " << metrics.Vxm << " " << metrics.Vzm << '\n';
+	integrals << metrics.Vmax_xz << " " << metrics.Vxm << " " << metrics.Vzm << " ";
+	integrals << metrics.divergence_max << " "
+		<< metrics.mean_wT << " " << metrics.mean_wC1 << " " << metrics.mean_wC2 << " "
+		<< metrics.DTmax << " " << metrics.DCmax << '\n';
 
 	integrals.flush();
 }
@@ -140,7 +170,7 @@ inline void write_ra_row(std::ostream& ra_tab, const Configuration& c, const RUN
 
 	ra_tab << c.Ra << " " << stats.Ek << " " << stats.Vmax << " " << metrics.center_vy << " " << elapsed_seconds << " " << run.timeq
 		<< " " << stats.AMx << " " << stats.AMy << " " << stats.AMz << " " << stats.AM
-		<< " " << metrics.Nu << " " << " " << metrics.Sh << " " << metrics.Tmax_xz << " " << metrics.Txm << " " << metrics.Tzm
+		<< " " << metrics.Nu << " " << " " << metrics.ShC2 << " " << metrics.Tmax_xz << " " << metrics.Txm << " " << metrics.Tzm
 		<< '\n';
 	ra_tab.flush();
 }

@@ -7,7 +7,7 @@ ny = 20
 nz = 20
 
 tau = 0.0002
-Ra = 2300
+Ra = 5000
 increment = -25
 read_recovery = 1
 call_max = 1
