@@ -38,6 +38,17 @@ public:
 		swap_6 << < KERNEL(launch1d) >>> (d.ux, d.vx, d.uy, d.vy, d.uz, d.vz, d.T0, d.T, d.C0, d.C, d.C20, d.C2);
     }
 
+	void proceed_ternary()
+	{
+		quasi_velocity << < KERNEL(launch3d) >> > (d.ux, d.uy, d.uz, d.vx, d.vy, d.vz, d.T, d.T0, d.C, d.C0, d.C2, d.C20);
+		temperature << < KERNEL(launch3d) >> > (d.ux, d.uy, d.uz, d.vx, d.vy, d.vz, d.T, d.T0, d.C, d.C0, d.C2, d.C20);
+		concentration1 << < KERNEL(launch3d) >> > (d.ux, d.uy, d.uz, d.vx, d.vy, d.vz, d.T, d.T0, d.C, d.C0, d.C2, d.C20);
+		concentration2 << < KERNEL(launch3d) >> > (d.ux, d.uy, d.uz, d.vx, d.vy, d.vz, d.T, d.T0, d.C, d.C0, d.C2, d.C20);
+		pressure.solve_v1b();
+		velocity_correction << < KERNEL(launch3d) >> > (d.ux, d.uy, d.uz, d.vx, d.vy, d.vz, d.p);
+		swap_6 << < KERNEL(launch1d) >> > (d.ux, d.vx, d.uy, d.vy, d.uz, d.vz, d.T0, d.T, d.C0, d.C, d.C20, d.C2);
+	}
+
 	void proceed_binary_fixed_temperature()
 	{
 		quasi_velocity << < KERNEL(launch3d) >> > (d.ux, d.uy, d.uz, d.vx, d.vy, d.vz, d.T, d.T0, d.C, d.C0, d.C2, d.C20);

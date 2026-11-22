@@ -32,7 +32,7 @@ RUN_STATE run;
 FuncTimer ftimer;
 
 
-int main(int argc, char** argv) 
+int main(int argc, char** argv)
 {
 	const bool smoke_test = argc == 2 && std::string(argv[1]) == "--smoke-test";
 	init_parameters(host, run);
@@ -44,8 +44,8 @@ int main(int argc, char** argv)
 
 	h.N = d.N = host.N;
 	h.Nbytes = d.Nbytes = host.Nbytes;
-	h.total_bytes = allocate_host_arrays(	{ &h.T, &h.p, &h.vx, &h.vy, &h.vz, &h.C, &h.C2 }, host.N);
-	d.total_bytes = allocate_device_arrays(	{ &d.T, &d.T0, &d.p, &d.p0, &d.ux, &d.uy, &d.uz,  &d.vx, &d.vy, &d.vz, &d.C, &d.C0, &d.C2, &d.C20 }, host.N);
+	h.total_bytes = allocate_host_arrays({ &h.T, &h.p, &h.vx, &h.vy, &h.vz, &h.C, &h.C2 }, host.N);
+	d.total_bytes = allocate_device_arrays({ &d.T, &d.T0, &d.p, &d.p0, &d.ux, &d.uy, &d.uz,  &d.vx, &d.vy, &d.vz, &d.C, &d.C0, &d.C2, &d.C20 }, host.N);
 	gpu.gpu_mem_allocated = d.total_bytes;
 
 
@@ -54,9 +54,9 @@ int main(int argc, char** argv)
 	std::ofstream integrals;
 
 	Backup recovery("recovery");
-	const std::vector<double*> recovery_fields{	h.vx, h.vy, h.vz, h.p, h.T, h.C, h.C2, };
-	const std::vector<double*> output_fields  {	h.vx, h.vy, h.vz, h.p, h.T, h.C, h.C2, };
-	
+	const std::vector<double*> recovery_fields{ h.vx, h.vy, h.vz, h.p, h.T, h.C, h.C2, };
+	const std::vector<double*> output_fields{ h.vx, h.vy, h.vz, h.p, h.T, h.C, h.C2, };
+
 
 	const double Ra_from_parameters = host.Ra;
 	const int initial_call_i = run.call_i;
@@ -64,7 +64,7 @@ int main(int argc, char** argv)
 
 	if (run.read_recovery)
 	{
-		recovered =	recovery.read(run.iter, run.timeq, run.call_i, host, recovery_fields) == 0;
+		recovered = recovery.read(run.iter, run.timeq, run.call_i, host, recovery_fields) == 0;
 		if (recovered)
 		{
 			copy_fields_to_device(host, h, d);
@@ -72,7 +72,7 @@ int main(int argc, char** argv)
 		}
 		else
 		{
-			std::cerr << "Recovery file could not be read. Starting from initial fields."	<< std::endl;
+			std::cerr << "Recovery file could not be read. Starting from initial fields." << std::endl;
 		}
 	}
 	if (!recovered)
@@ -82,15 +82,14 @@ int main(int argc, char** argv)
 		run.reset();
 		//init_fields(host, h, d);
 		init_fields_conductive_state(host, h, d);
-		Ra_tab.open("Ra.dat");
 		integrals.open("integrals.dat");
-		write_ra_row(Ra_tab, host, run, stats, OutputMetrics{}, 0.0, true);
 	}
 	else
 	{
-		Ra_tab.open("Ra.dat", std::ofstream::app);
 		integrals.open("integrals.dat", std::ofstream::app);
 	}
+	open_ra_table(Ra_tab, recovered);
+	bool write_recovery_header = recovered;
 
 
 	Solver solver(host, d);
@@ -115,7 +114,7 @@ int main(int argc, char** argv)
 
 			run.next_iter(host.tau);
 			if (run.timeq > run.timeq_max) run.stop_signal = 1;
-			solver.proceed_binary_fixed_temperature();
+			solver.proceed_ternary();
 
 
 
@@ -124,12 +123,13 @@ int main(int argc, char** argv)
 			{
 				copy_fields_to_host(host, h, d, run.divice_already_copied);
 
-				
+
 				OutputMetrics metrics = collect_output_metrics(host, h, stats);
 				print_metrics(cout, host, run, stats, metrics);
 				const double elapsed_seconds = ftimer.update_and_get("main");
 
-				write_integrals_row(integrals, host, run, stats, metrics, elapsed_seconds);
+				write_integrals_row(integrals, host, run, stats, metrics, elapsed_seconds, run.iter == 1 || write_recovery_header);
+				write_recovery_header = false;
 
 				//if ((run.timeq > 1500 && abs(stats.Ek - stats.Ek_old) < 1e-8 && host.Ra == 5000) || (run.timeq > 1000 && abs(stats.Ek - stats.Ek_old) < 1e-7 && host.Ra < 5000)) {
 				if ((run.timeq > run.timeq_min && (metrics.Ek_change_relative < 1e-7 || metrics.Ek_change_abs < 1e-12)))
@@ -162,12 +162,13 @@ int main(int argc, char** argv)
 			//exit time loop
 			if (run.stop_signal != 0)
 			{
+				copy_fields_to_host(host, h, d, run.divice_already_copied);
 				std::string label = _str(host.Ra) + " " + _str(run.timeq);
 				std::string extra_line = "iter,time,call_i,Ra= " + _str(run.iter) + " " + _str(run.timeq) + " " + _str(run.call_i) + " " + _str(host.Ra);
 				OutputMetrics metrics = collect_output_metrics(host, h, stats);
 				const double elapsed_seconds = ftimer.update_and_get("main");
 
-				write_ra_row(Ra_tab, host, run, stats, metrics, elapsed_seconds, false);
+				write_ra_row(Ra_tab, host, run, stats, metrics, elapsed_seconds);
 				write_fields("fields/final/", label, host, output_fields, "vx, vy, vz, p, T, C1, C2", extra_line);
 
 				if (run.stop_signal == 1) run.reset();

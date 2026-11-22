@@ -1,5 +1,5 @@
 # Long nonlinear evolution of the conductive-state m=(1,0) perturbation.
-Lx = 2.0
+Lx = 6.0
 Ly = 1.0
 Lz = 1.0
 nx = 40
@@ -10,8 +10,8 @@ tau = 0.0002
 Ra = 5000
 increment = -50
 read_recovery = 0
-call_max = 1
-timeq_min = 1000
+call_max = 100
+timeq_min = 5
 timeq_max = 200000
 
 Pr = 10.0

@@ -2,9 +2,12 @@
 #include <fstream>
 #include <iomanip>
 #include <ostream>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <cmath>
+#include <cstdio>
 #include "../common/types.h"
 #include "../common/math.h"
 #include "../common/utilities.h"
@@ -92,9 +95,6 @@ inline OutputMetrics collect_output_metrics(const Configuration& c, const Arrays
 	metrics.Ek_change = stats.Ek - stats.Ek_old;
 	metrics.Ek_change_abs = std::abs(metrics.Ek_change);
 	metrics.Ek_change_relative = metrics.Ek_change_abs / stats.Ek_old;
-	constexpr double pi = 3.1415926535897932384626433832795;
-
-	const double horizontal_count = (c.nx - 1.0) * (c.nz - 1.0);
 
 	double wt = 0, wc1 = 0, wc2 = 0;
 	for (unsigned int kk = 1; kk < c.nz; ++kk)
@@ -106,9 +106,10 @@ inline OutputMetrics collect_output_metrics(const Configuration& c, const Arrays
 				wc1 += h.vy[l] * h.C[l];
 				wc2 += h.vy[l] * h.C2[l];
 			}
-	metrics.mean_wT = wt * c.dV;
-	metrics.mean_wC1 = wc1 * c.dV;
-	metrics.mean_wC2 = wc2 * c.dV;
+	const double volume_weight = c.dV / (c.Lx * c.Ly * c.Lz);
+	metrics.mean_wT = wt * volume_weight;
+	metrics.mean_wC1 = wc1 * volume_weight;
+	metrics.mean_wC2 = wc2 * volume_weight;
 
 	return metrics;
 }
@@ -133,13 +134,13 @@ inline void print_metrics(std::ostream& output, const Configuration& c, const RU
 }
 
 inline void write_integrals_row(std::ostream& integrals, const Configuration& c, const RUN_STATE& run, const StatValues& stats,
-	const OutputMetrics& metrics, double elapsed_seconds)
+	const OutputMetrics& metrics, double elapsed_seconds, bool write_header)
 {
-	if (run.iter == 1)
+	if (write_header)
 	{
 		integrals << "t, Ek, Vmax,  time(min), Vc, Tc, Cc, Vq, Tq, Cq, dEk, dEkRel, AMx, AMy, AMz, AMabs, vxmax, vymax, vzmax, ";
 		integrals << "Nu, ShC2, ShC1, Tmax_xm, Txm, Tzm, Vmax_xm, Vxm, Vzm, ";
-		integrals << "w_mode1x_cos, w_mode1x_sin, w_mode1z_cos, w_mode1z_sin, c1_dev_rms, divergence_max, mean_wT, mean_wC1, mean_wC2, DTmax, DCmax, Ra=" << c.Ra << '\n';
+		integrals << "divergence_max, mean_wT, mean_wC1, mean_wC2, DTmax, DCmax, Ra=" << c.Ra << '\n';
 	}
 
 	integrals << std::setprecision(20) << std::fixed;
@@ -159,19 +160,79 @@ inline void write_integrals_row(std::ostream& integrals, const Configuration& c,
 	integrals.flush();
 }
 
-inline void write_ra_row(std::ostream& ra_tab, const Configuration& c, const RUN_STATE& run,
-	const StatValues& stats, const OutputMetrics& metrics, double elapsed_seconds, bool write_header)
+inline void open_ra_table(std::ofstream& ra_tab, bool append)
 {
-	if (write_header)
+	const char* path = "Ra.dat";
+	const std::string previous_header = "Ra, Ek, Vmax, Vc, time(min), t, AMx, AMy, AMz, AMabs, Nu, ShC2, ShC1, Tmax_xm, Txm, Tzm";
+	const std::string header = previous_header + ", mean_wT, mean_wC1, mean_wC2";
+	bool has_header = false;
+	if (append)
 	{
-		ra_tab << "Ra, Ek, Vmax, Vc, time(min), t, AMx, AMy, AMz, AMabs, Nu, Sh, Tmax_xm, Txm, Tzm\n";
-		return;
-	}
+		std::ifstream previous(path);
+		std::string line;
+		if (std::getline(previous, line))
+		{
+			has_header = true;
+			if (line != header)
+			{
+				const char* legacy_header = "Ra, Ek, Vmax, Vc, time(min), t, AMx, AMy, AMz, AMabs, Nu, Sh, Tmax_xm, Txm, Tzm";
+				const bool missing_sh_c1 = line != previous_header;
+				const int previous_columns = missing_sh_c1 ? 15 : 16;
+				std::ostringstream updated;
+				updated << header << '\n';
+				const auto append_previous_row = [&](std::string row_text)
+					{
+						if (row_text.find_first_not_of(" \t\r") == std::string::npos) return;
+						std::istringstream row(row_text);
+						double ra;
+						std::string token;
+						if (!(row >> ra)) throw std::runtime_error("Invalid row in legacy Ra.dat");
+						for (int column = 1; column < 12; ++column) row >> token;
+						const auto after_sh_c2 = row.tellg();
+						for (int column = 12; column < previous_columns; ++column) row >> token;
+						if (!row || row >> token) throw std::runtime_error("Invalid column count in legacy Ra.dat");
+						if (missing_sh_c1) row_text.insert(static_cast<std::size_t>(after_sh_c2), " nan");
+						updated << row_text << " nan nan nan\n";
+					};
+				if (line != previous_header && line != legacy_header) append_previous_row(line);
+				while (std::getline(previous, line)) append_previous_row(line);
+				if (previous.bad()) throw std::runtime_error("Cannot read Ra.dat");
+				previous.close();
 
+				const char* temporary = "Ra.dat.tmp";
+				std::ofstream temp(temporary);
+				temp << updated.str();
+				temp.close();
+				if (!temp) throw std::runtime_error("Cannot update Ra.dat");
+#ifdef _WIN32
+				if (!MoveFileExA(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+#else
+				if (std::rename(temporary, path) != 0)
+#endif
+					throw std::runtime_error("Cannot replace Ra.dat");
+			}
+		}
+		else if (previous.bad()) throw std::runtime_error("Cannot read Ra.dat");
+	}
+	ra_tab.open(path, append ? std::ios::app : std::ios::out);
+	if (!ra_tab) throw std::runtime_error("Cannot open Ra.dat for output");
+	if (!has_header) ra_tab << header << '\n';
+}
+
+inline void write_ra_row(std::ostream& ra_tab, const Configuration& c, const RUN_STATE& run,
+	const StatValues& stats, const OutputMetrics& metrics, double elapsed_seconds)
+{
 	ra_tab << c.Ra << " " << stats.Ek << " " << stats.Vmax << " " << metrics.center_vy << " " << elapsed_seconds << " " << run.timeq
 		<< " " << stats.AMx << " " << stats.AMy << " " << stats.AMz << " " << stats.AM
-		<< " " << metrics.Nu << " " << " " << metrics.ShC2 << " " << metrics.Tmax_xz << " " << metrics.Txm << " " << metrics.Tzm
-		<< '\n';
+		<< " " << metrics.Nu;
+	for (double sh : { metrics.ShC2, metrics.ShC1 })
+	{
+		ra_tab << ' ';
+		if (std::isfinite(sh)) ra_tab << sh;
+		else ra_tab << "nan";
+	}
+	ra_tab << " " << metrics.Tmax_xz << " " << metrics.Txm << " " << metrics.Tzm
+		<< " " << metrics.mean_wT << " " << metrics.mean_wC1 << " " << metrics.mean_wC2 << '\n';
 	ra_tab.flush();
 }
 
