@@ -175,32 +175,6 @@ void copy_fields_to_host(const Configuration& c, Arrays& h, const Arrays& d, int
 	already_copied = 1;
 }
 
-void init_fields(const Configuration& c, Arrays& h, Arrays& d)
-{
-	std::fill_n(h.T, c.N, 0.0);
-	std::fill_n(h.p, c.N, 0.0);
-	std::fill_n(h.vx, c.N, 0.0);
-	std::fill_n(h.vy, c.N, 0.0);
-	std::fill_n(h.vz, c.N, 0.0);
-	std::fill_n(h.C, c.N, 0.0);
-	std::fill_n(h.C2, c.N, 0.0);
-
-	constexpr double pi = 3.1415926535897932384626433832795;
-	for (unsigned int k = 0; k <= c.nz; ++k)
-	{
-		for (unsigned int j = 0; j <= c.ny; ++j)
-		{
-			for (unsigned int i = 0; i <= c.nx; ++i)
-			{
-				const unsigned int q = i + c.offset * j + c.offset2 * k;
-				h.C2[q] = 1e-5 * std::sin(2.0 * pi * i * c.hx / c.Lx) * std::sin(2.0 * pi * k * c.hz / c.Lz) * (1.0 - c.hy * j) * c.psi2;
-			}
-		}
-	}
-
-	copy_fields_to_device(c, h, d);
-}
-
 // Periodic directions have two ghost planes and nx-1 / nz-1 unique points.
 void init_fields_conductive_state(const Configuration& c, Arrays& h, Arrays& d)
 {
@@ -219,9 +193,9 @@ void init_fields_conductive_state(const Configuration& c, Arrays& h, Arrays& d)
 				h.T[q] = c.Q * (y - 0.5 * c.Ly);
 				h.C[q] = c.psi1 * h.T[q];
 				// seed as in PoF 38, 064104 (2026): 1e-5*sin(2pi x/Lx)*sin(2pi y/Ly)*(1-z)*psi
-				h.C2[q] = c.psi2 * h.T[q] + 1e-5 * std::sin(2 * pi * x / c.Lx)
-					* std::sin(2 * pi * y / c.Ly) * (1.0 - y) * c.psiS;
+				h.C2[q] = c.psi2 * h.T[q] + 1e-5 * std::sin(2 * pi * x / c.Lx)* std::sin(2 * pi * y / c.Ly) * (1.0 - y) * c.psiS;
 				h.p[q] = c.Ra / c.Pr * (1 + c.psiS) * c.Q * (0.5 * y * y - 0.5 * c.Ly * y);
+				h.T[q] += 1e-3 * std::sin(pi * y / c.Ly) * std::cos(2.0 * pi * x / c.Lx);
 			}
 	copy_fields_to_device(c, h, d);
 }

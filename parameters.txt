@@ -8,10 +8,10 @@ nz = 20
 
 tau = 0.0002
 Ra = 5000
-increment = -25
-read_recovery = 1
+increment = -50
+read_recovery = 0
 call_max = 1
-timeq_min = 100000
+timeq_min = 1000
 timeq_max = 200000
 
 Pr = 10.0
@@ -20,7 +20,7 @@ Sc12 = 0.0
 Sc21 = 0.0
 Sc22 = 1000.0
 psi1 = 0.0
-psiS = -0.25
+psiS = -0.0
 Q = -1.0
 alpha = 0.0
 

@@ -131,7 +131,7 @@ public:
 			if (eps < eps_iter)
 				break;
 
-			if (k % 1000 == 0)
+			if (k % 10000 == 0)
 				std::cout << "device k = " << k << ", eps = " << eps << std::endl;
 		}
 
